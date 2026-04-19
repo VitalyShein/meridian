@@ -2033,9 +2033,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
     // Route internally via app.fetch() — no network roundtrip.
     // Hono resolves the path in-process; the URL scheme/host are ignored.
+    // Forward the caller's auth header(s) so requireAuth on /v1/messages
+    // (enabled by MERIDIAN_API_KEY) still passes on the internal dispatch.
+    const internalHeaders: Record<string, string> = { "Content-Type": "application/json" }
+    const authHeader = c.req.header("authorization")
+    if (authHeader) internalHeaders["authorization"] = authHeader
+    const apiKeyHeader = c.req.header("x-api-key")
+    if (apiKeyHeader) internalHeaders["x-api-key"] = apiKeyHeader
     const internalReq = new Request("http://internal/v1/messages", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: internalHeaders,
       body: JSON.stringify(anthropicBody),
     })
     const internalRes = await app.fetch(internalReq)
