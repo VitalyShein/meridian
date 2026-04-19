@@ -22,9 +22,15 @@
 
 export type OpenAiRole = "system" | "user" | "assistant"
 
+export interface OpenAiImageUrl {
+  url: string
+  detail?: string
+}
+
 export interface OpenAiContentPart {
   type: string
   text?: string
+  image_url?: OpenAiImageUrl
 }
 
 export interface OpenAiMessage {
@@ -42,9 +48,16 @@ export interface OpenAiChatRequest {
   top_p?: number
 }
 
+export interface AnthropicImageSource {
+  type: "base64" | "url"
+  media_type?: string
+  data?: string
+  url?: string
+}
+
 export interface AnthropicMessage {
   role: "user" | "assistant"
-  content: string
+  content: string | AnthropicContentBlock[]
 }
 
 export interface AnthropicRequestBody {
@@ -65,6 +78,7 @@ export interface AnthropicUsage {
 export interface AnthropicContentBlock {
   type: string
   text?: string
+  source?: AnthropicImageSource
 }
 
 export interface AnthropicResponse {
@@ -118,12 +132,86 @@ export interface OpenAiModel {
 /**
  * Normalise an OpenAI message content field to a plain string.
  * Handles both string content and structured content arrays.
+ * Non-text parts (e.g. image_url) are dropped — use this only for system
+ * messages and history stringification, not for the final user turn.
  */
 export function extractOpenAiContent(content: string | OpenAiContentPart[]): string {
   if (typeof content === "string") return content
   return content
     .filter(p => p.type === "text" && typeof p.text === "string")
     .map(p => p.text!)
+    .join("")
+}
+
+/**
+ * Parse a data URL of the form `data:<mime>;base64,<data>`.
+ * Returns null for any other URL shape.
+ */
+function parseDataUrl(url: string): { mediaType: string; data: string } | null {
+  const match = /^data:([^;,]+);base64,(.+)$/s.exec(url)
+  if (!match) return null
+  return { mediaType: match[1]!, data: match[2]! }
+}
+
+/**
+ * Convert a single OpenAI content part into an Anthropic content block.
+ * Returns null for unrecognised or empty parts.
+ */
+function openAiPartToAnthropic(part: OpenAiContentPart): AnthropicContentBlock | null {
+  if (part.type === "text" && typeof part.text === "string") {
+    return { type: "text", text: part.text }
+  }
+  if (part.type === "image_url" && part.image_url?.url) {
+    const url = part.image_url.url
+    const parsed = parseDataUrl(url)
+    if (parsed) {
+      return {
+        type: "image",
+        source: { type: "base64", media_type: parsed.mediaType, data: parsed.data },
+      }
+    }
+    return { type: "image", source: { type: "url", url } }
+  }
+  return null
+}
+
+/**
+ * Convert an OpenAI message content field into an Anthropic content field.
+ * Returns a plain string when only text parts are present (wire-compatible with
+ * the original single-turn code path); returns a content block array when any
+ * non-text part (image_url) is present so multimodal inputs reach the model.
+ */
+export function convertOpenAiContentToAnthropic(
+  content: string | OpenAiContentPart[]
+): string | AnthropicContentBlock[] {
+  if (typeof content === "string") return content
+  const blocks: AnthropicContentBlock[] = []
+  let hasNonText = false
+  for (const part of content) {
+    const block = openAiPartToAnthropic(part)
+    if (!block) continue
+    if (block.type !== "text") hasNonText = true
+    blocks.push(block)
+  }
+  if (!hasNonText) {
+    return blocks.map(b => b.text ?? "").join("")
+  }
+  return blocks
+}
+
+/**
+ * Stringify an already-converted Anthropic message content for history packing.
+ * Image blocks are replaced with a [image] placeholder so Claude still sees
+ * where a prior turn attached visual context.
+ */
+function stringifyAnthropicContent(content: string | AnthropicContentBlock[]): string {
+  if (typeof content === "string") return content
+  return content
+    .map(b => {
+      if (b.type === "text") return b.text ?? ""
+      if (b.type === "image") return "[image]"
+      return ""
+    })
     .join("")
 }
 
@@ -146,13 +234,13 @@ export function translateOpenAiToAnthropic(body: OpenAiChatRequest): AnthropicRe
   const turns: AnthropicMessage[] = []
 
   for (const msg of messages) {
-    const text = extractOpenAiContent(msg.content ?? "")
     if (msg.role === "system") {
+      const text = extractOpenAiContent(msg.content ?? "")
       if (text) systemParts.push(text)
     } else {
       turns.push({
         role: msg.role === "assistant" ? "assistant" : "user",
-        content: text,
+        content: convertOpenAiContentToAnthropic(msg.content ?? ""),
       })
     }
   }
@@ -165,7 +253,7 @@ export function translateOpenAiToAnthropic(body: OpenAiChatRequest): AnthropicRe
 
   if (turns.length > 1) {
     const history = turns.slice(0, -1)
-      .map(m => `${m.role}: ${m.content}`)
+      .map(m => `${m.role}: ${stringifyAnthropicContent(m.content)}`)
       .join("\n")
     const historyBlock =
       `<conversation_history>\n${history}\n</conversation_history>\n\n` +

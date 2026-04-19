@@ -6,6 +6,7 @@
 import { describe, it, expect } from "bun:test"
 import {
   extractOpenAiContent,
+  convertOpenAiContentToAnthropic,
   translateOpenAiToAnthropic,
   translateAnthropicToOpenAi,
   translateAnthropicSseEvent,
@@ -37,6 +38,56 @@ describe("extractOpenAiContent", () => {
 
   it("returns empty string for empty array", () => {
     expect(extractOpenAiContent([])).toBe("")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// convertOpenAiContentToAnthropic
+// ---------------------------------------------------------------------------
+
+describe("convertOpenAiContentToAnthropic", () => {
+  it("returns string content as-is", () => {
+    expect(convertOpenAiContentToAnthropic("hi")).toBe("hi")
+  })
+
+  it("collapses text-only content array to a plain string", () => {
+    expect(convertOpenAiContentToAnthropic([
+      { type: "text", text: "hello" },
+      { type: "text", text: " world" },
+    ])).toBe("hello world")
+  })
+
+  it("converts data-URL image_url parts into base64 image blocks", () => {
+    const result = convertOpenAiContentToAnthropic([
+      { type: "text", text: "describe" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+    ])
+    expect(Array.isArray(result)).toBe(true)
+    expect(result).toEqual([
+      { type: "text", text: "describe" },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+    ])
+  })
+
+  it("converts http(s) image_url parts into url-style image blocks", () => {
+    const result = convertOpenAiContentToAnthropic([
+      { type: "image_url", image_url: { url: "https://example.com/cat.jpg" } },
+    ])
+    expect(result).toEqual([
+      { type: "image", source: { type: "url", url: "https://example.com/cat.jpg" } },
+    ])
+  })
+
+  it("drops unrecognised parts but keeps images", () => {
+    const result = convertOpenAiContentToAnthropic([
+      { type: "text", text: "look:" },
+      { type: "input_audio" },
+      { type: "image_url", image_url: { url: "data:image/jpeg;base64,QQQQ" } },
+    ])
+    expect(result).toEqual([
+      { type: "text", text: "look:" },
+      { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "QQQQ" } },
+    ])
   })
 })
 
@@ -194,6 +245,44 @@ describe("translateOpenAiToAnthropic", () => {
       }],
     })
     expect(result!.messages[0]!.content).toBe("structured")
+  })
+
+  it("forwards image_url parts as Anthropic image blocks on the final turn", () => {
+    const result = translateOpenAiToAnthropic({
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: "what is this?" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,ZZZZ" } },
+        ],
+      }],
+    })
+    expect(result!.messages).toEqual([{
+      role: "user",
+      content: [
+        { type: "text", text: "what is this?" },
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "ZZZZ" } },
+      ],
+    }])
+  })
+
+  it("stringifies images in prior turns as [image] in conversation history", () => {
+    const result = translateOpenAiToAnthropic({
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "first" },
+            { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+          ],
+        },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: "follow up" },
+      ],
+    })
+    expect(result!.messages).toEqual([{ role: "user", content: "follow up" }])
+    expect(result!.system).toContain("user: first[image]")
+    expect(result!.system).toContain("assistant: ok")
   })
 
   it("sets stream from body", () => {
