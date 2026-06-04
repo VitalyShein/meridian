@@ -4,16 +4,14 @@
  * Pure functions — no I/O, no side effects. Used by the /v1/chat/completions
  * and /v1/models routes in server.ts.
  *
- * Design note: OpenAI clients always send the full conversation history on
- * every request. Feeding that directly into Meridian's session system would
- * classify every turn as "undo" or "diverged" (since the message list keeps
- * changing). Instead:
- *   1. The last user message becomes the actual SDK request
- *   2. Prior turns are packed into a <conversation_history> block in the
- *      system prompt so Claude has context
- *   3. Each chat completions request gets a fresh SDK session
- * This is intentional — OpenAI-format clients replay full history themselves
- * and don't benefit from Meridian's session resumption.
+ * Design note (FORK owui-cache): OpenAI clients always send the full
+ * conversation history on every request, and this fork forwards it as the
+ * real Anthropic message array. That lets the session/lineage system verify
+ * append-only growth, resume the underlying SDK session, and serve the prefix
+ * from prompt cache (cache_read) exactly like native /v1/messages clients.
+ * Upstream instead packs prior turns into a <conversation_history> system
+ * block and sends only the last turn, which shifts the cache breakpoint every
+ * turn and re-writes the whole history to cache.
  */
 
 // ---------------------------------------------------------------------------
@@ -587,24 +585,20 @@ export function translateOpenAiToAnthropic(
     }
   }
 
-  // Pack prior turns into system context so each request is a fresh session.
-  // OpenAI clients resend full history; Meridian's session system would
-  // misclassify repeated history as undo/diverged. This avoids that.
-  let systemPrompt = systemParts.join("\n")
-  let messagesToSend: AnthropicMessage[] = turns
-
-  if (turns.length > 1 && !options.preserveConversationHistory) {
-    const history = turns.slice(0, -1)
-      .map(m => `${m.role}: ${summarizeAnthropicContent(m.content)}`)
-      .join("\n")
-    const historyBlock =
-      `<conversation_history>\n${history}\n</conversation_history>\n\n` +
-      `Continue this conversation naturally. Respond to the user's latest message.`
-    systemPrompt = systemPrompt
-      ? `${systemPrompt}\n\n${historyBlock}`
-      : historyBlock
-    messagesToSend = turns.slice(-1)
-  }
+  const systemPrompt = systemParts.join("\n")
+  // FORK PATCH (owui-cache): send the FULL conversation as real Anthropic
+  // messages instead of packing prior turns into the system prompt. Routing
+  // OpenAI-format clients (OpenWebUI, etc.) through Meridian's normal message
+  // array lets the session/lineage system recognize the conversation and
+  // RESUME the underlying Claude SDK session — which is what enables
+  // incremental prompt caching (cache_read) exactly like native /v1/messages
+  // clients. The upstream behaviour rebuilt a growing <conversation_history>
+  // system prompt every turn, so the breakpoint shifted and the whole history
+  // was re-written to cache each turn (cache_write≈full, cache_read≈0). The
+  // lineage system already classifies append-only growth as a continuation
+  // (verified) and handles regen/edit as undo/diverged, so the original
+  // "would misclassify history" concern does not hold.
+  const messagesToSend: AnthropicMessage[] = turns
 
   const result: AnthropicRequestBody = {
     model: body.model ?? CANONICAL_SONNET_MODEL,
