@@ -529,24 +529,20 @@ export function translateOpenAiToAnthropic(body: OpenAiChatRequest): AnthropicRe
     }
   }
 
-  // Pack prior turns into system context so each request is a fresh session.
-  // OpenAI clients resend full history; Meridian's session system would
-  // misclassify repeated history as undo/diverged. This avoids that.
-  let systemPrompt = systemParts.join("\n")
-  let messagesToSend: AnthropicMessage[] = turns
-
-  if (turns.length > 1) {
-    const history = turns.slice(0, -1)
-      .map(m => `${m.role}: ${summarizeAnthropicContent(m.content)}`)
-      .join("\n")
-    const historyBlock =
-      `<conversation_history>\n${history}\n</conversation_history>\n\n` +
-      `Continue this conversation naturally. Respond to the user's latest message.`
-    systemPrompt = systemPrompt
-      ? `${systemPrompt}\n\n${historyBlock}`
-      : historyBlock
-    messagesToSend = turns.slice(-1)
-  }
+  const systemPrompt = systemParts.join("\n")
+  // FORK PATCH (owui-cache): send the FULL conversation as real Anthropic
+  // messages instead of packing prior turns into the system prompt. Routing
+  // OpenAI-format clients (OpenWebUI, etc.) through Meridian's normal message
+  // array lets the session/lineage system recognize the conversation and
+  // RESUME the underlying Claude SDK session — which is what enables
+  // incremental prompt caching (cache_read) exactly like native /v1/messages
+  // clients. The upstream behaviour rebuilt a growing <conversation_history>
+  // system prompt every turn, so the breakpoint shifted and the whole history
+  // was re-written to cache each turn (cache_write≈full, cache_read≈0). The
+  // lineage system already classifies append-only growth as a continuation
+  // (verified) and handles regen/edit as undo/diverged, so the original
+  // "would misclassify history" concern does not hold.
+  const messagesToSend: AnthropicMessage[] = turns
 
   const result: AnthropicRequestBody = {
     model: body.model ?? CANONICAL_SONNET_MODEL,
