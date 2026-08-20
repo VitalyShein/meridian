@@ -4070,13 +4070,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 return
               }
 
-              if (passthrough && streamedToolUseIds.size > 0 && !sawCanonicalResult) {
-                // The client may already have advanced past this tool turn, so
-                // a failed hidden drain invalidates even an older cached mapping.
-                evictSession(profileSessionId, profileScopedCwd, body.messages || [])
-                claudeLog("passthrough.noncanonical_session_evicted", { mode: "stream", reason: "drain_error" })
-              }
-
               const stderrOutput = stderrLines.join("\n").trim()
               if (stderrOutput && error instanceof Error && !error.message.includes(stderrOutput)) {
                 error.message = `${error.message}\nSubprocess stderr: ${stderrOutput}`
@@ -4128,6 +4121,49 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 capturedToolUses: capturedToolUses.length,
                 abortIsOurs: sawDuplicateToolUse,
               }) && messageStartEmitted
+
+              // A turn-cap stop is the one drain failure whose checkpoint is
+              // safe to keep, and the reason is specific: the SDK can only
+              // report `max_turns` from a `result` message it has already
+              // enqueued, and it awaits its transcript flush on `result`
+              // (Query.readMessages in the bundled agent SDK builds the error
+              // text from lastErrorResultText, which only a delivered result
+              // populates). So the transcript is committed by the time we see
+              // this — categorically unlike the abort-shaped failure that
+              // motivated the eviction, where a SIGTERM'd subprocess emits no
+              // result at all. That is the invariant passthroughEarlyStop.ts
+              // requires before a resumeSessionAt UUID may be published.
+              //
+              // Which also means `sawCanonicalResult` is already true here, so
+              // the eviction below would not have fired on this path anyway;
+              // naming the case in the guard is belt-and-braces, and the
+              // load-bearing half is the storeSession further down.
+              //
+              // Keeping it lets the next request rewind to the tool-use
+              // boundary and append the client's real tool_result, instead of
+              // replaying the conversation against a cold cache. Other drain
+              // failures remain unsafe and are evicted.
+              const recoverableCheckpoint =
+                canRecoverAsToolUse &&
+                sdkTerm.reason === "max_turns" &&
+                Boolean(currentSessionId) &&
+                Boolean(nextPassthroughToolCallAssistantUuid) &&
+                Boolean(nextPassthroughToolCallIds?.length) &&
+                earlyStopFired &&
+                !isIndependentSession &&
+                !sawDuplicateToolUse
+
+              if (
+                passthrough &&
+                streamedToolUseIds.size > 0 &&
+                !sawCanonicalResult &&
+                !recoverableCheckpoint
+              ) {
+                // The client may already have advanced past this tool turn, so
+                // a failed hidden drain invalidates even an older cached mapping.
+                evictSession(profileSessionId, profileScopedCwd, body.messages || [])
+                claudeLog("passthrough.noncanonical_session_evicted", { mode: "stream", reason: "drain_error" })
+              }
 
               if (canRecoverAsToolUse) {
                 // Log the recovery at session level (not error) — it's a
@@ -4191,6 +4227,26 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 ), "recover_message_stop")
 
                 recordEnvelopeViolations(checkUndeliveredToolUses(capturedToolUses, streamedToolUseIds))
+
+                if (recoverableCheckpoint) {
+                  storeSession(
+                    profileSessionId,
+                    body.messages || [],
+                    currentSessionId!,
+                    profileScopedCwd,
+                    sdkUuidMap,
+                    lastUsage,
+                    nextPassthroughToolCallAssistantUuid!,
+                    nextPassthroughToolCallIds!,
+                  )
+                  commitSessionTurn()
+                  claudeLog("passthrough.checkpoint_persisted", {
+                    mode: "stream",
+                    reason: "single_turn_boundary",
+                    toolCalls: nextPassthroughToolCallIds!.length,
+                  })
+                }
+
                 // Record as success — the client got a usable response.
                 const recoverTotalMs = Date.now() - requestStartAt
                 const recoverQueueWaitMs = totalQueueWaitMs(requestMeta)
