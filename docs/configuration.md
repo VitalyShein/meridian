@@ -30,6 +30,7 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_ROUTING` | — | `active` | Session-to-profile routing: `active` (all traffic to the active profile), `sticky` ([sticky session routing](profiles.md#sticky-session-routing)), or `priority` ([priority failover](profiles.md#priority-failover-routing)) |
 | `MERIDIAN_PROFILE_ORDER` | — | *(config order)* | Priority-mode pool order, comma-separated, highest priority first (e.g. `work,personal`). Also editable at `/settings`. |
 | `MERIDIAN_PASSTHROUGH_EARLY_STOP` | — | `1` | Set to `0` to disable [digest-turn elimination](#how-tool-calling-works-in-passthrough) and restore the old end-of-turn behavior |
+| `MERIDIAN_PASSTHROUGH_MAX_TURNS` | `CLAUDE_PROXY_PASSTHROUGH_MAX_TURNS` | *(unset — capped at 1)* | Pin the passthrough SDK turn budget. **Setting this opts out of [digest-turn elimination](#how-tool-calling-works-in-passthrough)** — an explicit value always wins over the cap, so a turn budget set to work around an older issue keeps paying for the discarded digest turn. Unset it unless you still need it. |
 | `MERIDIAN_SILENT_TURN_RECOVERY` | `CLAUDE_PROXY_SILENT_TURN_RECOVERY` | `1` | Set to `0` to stop spending a recovery turn on a [silent turn](#silent-turns). Detection and telemetry stay on either way |
 | `MERIDIAN_UPSTREAM_IDLE_MS` | `CLAUDE_PROXY_UPSTREAM_IDLE_MS` | `90000` | Milliseconds the upstream stream may go quiet before the turn is treated as stalled. Raise it for long-thinking turns that were being killed mid-flight; `0` disables the guard entirely. Applies to the recovery turn too. |
 | `MERIDIAN_SUPPRESS_SCRATCHPAD` | — | `1` | Set to `0` to let the SDK advertise its proxy-host scratchpad directory in passthrough mode |
@@ -379,7 +380,29 @@ MERIDIAN_PASSTHROUGH=0 meridian   # force internal
 
 For large tool sets (>15 tools), non-core tools are automatically deferred via the SDK's ToolSearch mechanism. Core tools (read, write, edit, bash, glob, grep) are always loaded eagerly. The deferral threshold is configurable with `MERIDIAN_DEFER_TOOL_THRESHOLD`.
 
-**Digest-turn elimination** — after a tool call is captured, the SDK would normally invoke the model one more time to "digest" the denial before ending the turn. That extra invocation is discarded by the proxy but fully billed — measured at ~400+ wasted output tokens and 2–3× extra latency per tool step (and on always-thinking models like Fable, a full thinking pass each time). Meridian now aborts the SDK query the moment every tool call's denial is persisted, so the digest turn never generates. Sessions remain resumable and tool-result attribution is unaffected. Kill switch: `MERIDIAN_PASSTHROUGH_EARLY_STOP=0` restores the old behavior.
+**Digest-turn elimination** — after a tool call is captured, the SDK would normally invoke the model one more time to "digest" the denial before ending the turn. That extra invocation is discarded by the proxy but fully billed — and on always-thinking models like Fable it costs a full thinking pass each time.
+
+Meridian eliminates it by capping `maxTurns` at 1 for passthrough turns, so the SDK stops at the tool-use boundary rather than starting the digest turn. The capped stop arrives as the SDK's `error_max_turns` result, which is safe to keep: the SDK can only report that from a `result` it has already enqueued, and it flushes its transcript on `result` — so the session is durably committed at the tool boundary and the next request resumes from it with the client's real `tool_result`. A turn that ends on its own (plain text, no tools) never asks for a second turn and so never trips the cap.
+
+Measured against the live SDK (sonnet, one tool call), capped vs. uncapped: **66 vs 159 output tokens and 0 vs ~127k cache-read tokens** — the digest turn drags the CLI's full context along with it. Parallel tool calls are unaffected: the SDK surfaces them within a single turn, so all of them still reach the client.
+
+The cap is lifted for the cases that genuinely need the SDK to keep going — deferred tools (ToolSearch discovery is a real round-trip), a configured advisor, and structured output — and an explicit `MERIDIAN_PASSTHROUGH_MAX_TURNS` always wins. Kill switch: `MERIDIAN_PASSTHROUGH_EARLY_STOP=0` restores the uncapped multi-turn behavior.
+
+> **Upgrade note.** If you previously set `MERIDIAN_PASSTHROUGH_MAX_TURNS` — most
+> likely to give deep orchestration chains more headroom (#494) — you will not
+> get this saving: an explicit budget wins over the cap by design, so every tool
+> call still pays for a digest turn. Try unsetting it. The reason the override
+> was needed is largely gone: it existed because wide parallel tool calls could
+> exhaust the budget, and under the cap the SDK stops at the tool boundary
+> instead of competing for turns with its own internal loop. If unsetting it
+> causes trouble, that is worth an issue rather than a permanent pin.
+>
+> Two other behaviours change with the cap, both deliberate. A passthrough tool
+> turn now ends on the SDK's `max_turns` result rather than a clean `success` —
+> that is the normal, expected shape, and `passthrough.checkpoint_persisted` in
+> `/telemetry/logs` is what confirms the session was preserved. And a turn that
+> hits the cap having produced content but no forwardable tool call is reported
+> as `stop_reason: "max_tokens"` (truncated) instead of failing the request.
 
 ### Silent turns
 
