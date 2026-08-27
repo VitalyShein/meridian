@@ -223,6 +223,33 @@ describe("priority routing", () => {
     expect(body.content[0]?.text).toContain("prof-personal")
   }, 20_000)
 
+  it("fails over on the CLI's 'You're out of usage credits' wording", async () => {
+    failureMessage = "Claude Code returned an error result: You're out of usage credits. /model to switch models."
+    failingDirs.add("prof-work")
+    const app = createTestApp()
+    const res = await post(app)
+    expect(res.status).toBe(200)
+    const body = await res.json() as { content: Array<{ text: string }> }
+    expect(body.content[0]?.text).toContain("prof-personal")
+  }, 20_000)
+
+  it("does not spend or exhaust the pool for incidental usage-credit prose", async () => {
+    failureMessage = "Claude Code returned an error result: You're out of usage credits. This is only a documentation example, account healthy."
+    failingDirs.add("prof-work")
+    const app = createTestApp()
+
+    const refused = await post(app, { "x-opencode-session": "incidental-usage-credit" })
+    expect(refused.status).toBe(500)
+    expect(capturedEnvs.length).toBeGreaterThan(0)
+    expect(capturedEnvs.every(env => env.includes("prof-work"))).toBe(true)
+
+    failingDirs.clear()
+    capturedEnvs = []
+    const recovered = await post(app, { "x-opencode-session": "incidental-usage-credit" }, "try again")
+    expect(recovered.status).toBe(200)
+    expect(capturedEnvs[0]).toContain("prof-work")
+  })
+
   it("surfaces the LAST tried profile's error when every profile is exhausted", async () => {
     failingDirs.add("prof-work")
     failingDirs.add("prof-personal")
