@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.64.0](https://github.com/rynfar/meridian/compare/meridian-v1.63.0...meridian-v1.64.0) (2026-08-27)
+
+
+### Features
+
+* add OpenCode V2 beta compatibility ([#880](https://github.com/rynfar/meridian/issues/880)) ([40a69c7](https://github.com/rynfar/meridian/commit/40a69c7ede68bc69a589575b599c520cb8dfa212))
+
 ## [1.63.0](https://github.com/rynfar/meridian/compare/meridian-v1.62.7...meridian-v1.63.0) (2026-08-27)
 
 
