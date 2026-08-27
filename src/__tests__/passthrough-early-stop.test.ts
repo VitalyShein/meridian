@@ -13,15 +13,17 @@
 import { describe, it, expect } from "bun:test"
 import {
   clientAbortDisposition,
+  coalesceCompleteToolResultContinuation,
+  findCompleteToolResultCheckpoint,
   createEarlyStopTracker,
   allForwardedCallsResolved,
   isClientForwardedToolUse,
-  isCompleteToolResultContinuation,
   noteAssistantContent,
   noteAssistantMessage,
   noteUserContent,
   settledToolCallAssistantUuid,
   shouldEarlyStop,
+  trackerCoversStreamedCalls,
 } from "../proxy/passthroughEarlyStop"
 
 import { PASSTHROUGH_MCP_PREFIX } from "../proxy/passthroughTools"
@@ -178,6 +180,35 @@ describe("assistant resume checkpoint", () => {
   })
 })
 
+describe("trackerCoversStreamedCalls", () => {
+  it("is false while an assistant fragment is still in flight", () => {
+    const tracker = createEarlyStopTracker()
+    noteAssistantMessage(tracker, sdkAssistant("a1", [toolUse("t1", "read")]))
+    // The wire carried two calls; only one has been armed so far.
+    expect(trackerCoversStreamedCalls(tracker, new Set(["t1", "t2"]))).toBe(false)
+  })
+
+  it("is true once every streamed call is armed", () => {
+    const tracker = createEarlyStopTracker()
+    noteAssistantMessage(tracker, sdkAssistant("a1", [toolUse("t1", "read")]))
+    noteAssistantMessage(tracker, sdkAssistant("a2", [toolUse("t2", "read")]))
+    expect(trackerCoversStreamedCalls(tracker, new Set(["t1", "t2"]))).toBe(true)
+  })
+
+  it("is false when nothing was streamed, so an empty turn cannot settle", () => {
+    const tracker = createEarlyStopTracker()
+    expect(trackerCoversStreamedCalls(tracker, new Set())).toBe(false)
+  })
+
+  it("is false when the sets are the same size but disagree", () => {
+    // Equal sizes must not be mistaken for equal sets — a regenerated call
+    // carries a fresh id, so a stale id would otherwise pass the count check.
+    const tracker = createEarlyStopTracker()
+    noteAssistantMessage(tracker, sdkAssistant("a1", [toolUse("t1", "read")]))
+    expect(trackerCoversStreamedCalls(tracker, new Set(["t-other"]))).toBe(false)
+  })
+})
+
 describe("early-stop tracking", () => {
   it("does not stop before any tool calls are seen", () => {
     const t = createEarlyStopTracker()
@@ -249,37 +280,110 @@ describe("early-stop tracking", () => {
 })
 
 
-describe("isCompleteToolResultContinuation", () => {
+describe("coalesceCompleteToolResultContinuation", () => {
   const result = (id: string, content: unknown = "ok") => ({ type: "tool_result", tool_use_id: id, content })
 
   it("accepts one complete parallel result batch", () => {
-    expect(isCompleteToolResultContinuation([
-      { role: "user", content: [result("t1"), result("t2")] },
-    ], ["t1", "t2"])).toBe(true)
+    const results = [result("t1"), result("t2")]
+    expect(coalesceCompleteToolResultContinuation([
+      { role: "user", content: results },
+    ], ["t1", "t2"])).toEqual([{ role: "user", content: results }])
+  })
+
+  it("accepts a parallel result batch in a different order", () => {
+    // Anthropic protocol matches tool_result by tool_use_id, not by position.
+    const results = [result("t2"), result("t1")]
+    expect(coalesceCompleteToolResultContinuation([
+      { role: "user", content: results },
+    ], ["t1", "t2"])).toEqual([{ role: "user", content: results }])
   })
 
   it("rejects a partial batch and an unknown result id", () => {
-    expect(isCompleteToolResultContinuation([
+    expect(coalesceCompleteToolResultContinuation([
       { role: "user", content: [result("t1")] },
-    ], ["t1", "t2"])).toBe(false)
-    expect(isCompleteToolResultContinuation([
+    ], ["t1", "t2"])).toBeUndefined()
+    expect(coalesceCompleteToolResultContinuation([
       { role: "user", content: [result("unknown")] },
-    ], ["t1"])).toBe(false)
+    ], ["t1"])).toBeUndefined()
   })
 
-  it("rejects multiple user messages so multimodal results stay on the final SDK input", () => {
-    expect(isCompleteToolResultContinuation([
-      { role: "user", content: [result("t1")] },
-      { role: "user", content: [{ type: "text", text: "continue" }] },
-    ], ["t1"])).toBe(false)
+  it("coalesces queued user messages so results stay on the final SDK input", () => {
+    const toolResult = result("t1")
+    const queuedText = { type: "text", text: "continue" }
+    const queuedImage = { type: "image", source: { type: "base64", data: "abc" } }
+    expect(coalesceCompleteToolResultContinuation([
+      { role: "user", content: [toolResult] },
+      { role: "user", content: "continue" },
+      { role: "user", content: [queuedImage] },
+    ], ["t1"])).toEqual([{ role: "user", content: [toolResult, queuedText, queuedImage] }])
   })
 
   it("requires tool results before ordinary user content", () => {
-    expect(isCompleteToolResultContinuation([
+    expect(coalesceCompleteToolResultContinuation([
       { role: "user", content: [{ type: "text", text: "first" }, result("t1")] },
-    ], ["t1"])).toBe(false)
-    expect(isCompleteToolResultContinuation([
+    ], ["t1"])).toBeUndefined()
+    expect(coalesceCompleteToolResultContinuation([
       { role: "user", content: [result("t1"), { type: "text", text: "then continue" }] },
-    ], ["t1"])).toBe(true)
+    ], ["t1"])).toBeDefined()
+  })
+
+  it("rejects a text-only assistant message before user results", () => {
+    expect(coalesceCompleteToolResultContinuation([
+      { role: "assistant", content: [{ type: "text", text: "intervening turn" }] },
+      { role: "user", content: [result("t1")] },
+    ], ["t1"])).toBeUndefined()
+  })
+
+  it("rejects an extra text-only assistant message after the complete echo", () => {
+    expect(coalesceCompleteToolResultContinuation([
+      { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "read", input: {} }] },
+      { role: "assistant", content: [{ type: "text", text: "intervening turn" }] },
+      { role: "user", content: [result("t1")] },
+    ], ["t1"])).toBeUndefined()
+  })
+
+  it("rejects tool results in a turn after queued user text", () => {
+    expect(coalesceCompleteToolResultContinuation([
+      { role: "user", content: [{ type: "text", text: "first" }] },
+      { role: "user", content: [result("t1")] },
+    ], ["t1"])).toBeUndefined()
+  })
+
+  it("rejects results split across turns, duplicated, or sent after queued content", () => {
+    expect(coalesceCompleteToolResultContinuation([
+      { role: "user", content: [result("t1")] },
+      { role: "user", content: [result("t2")] },
+    ], ["t1", "t2"])).toBeUndefined()
+    expect(coalesceCompleteToolResultContinuation([
+      { role: "user", content: [result("t1"), result("t1")] },
+    ], ["t1"])).toBeUndefined()
+    expect(coalesceCompleteToolResultContinuation([
+      { role: "user", content: [result("t1")] },
+      { role: "user", content: [{ type: "text", text: "continue" }, result("t1")] },
+    ], ["t1"])).toBeUndefined()
+    expect(coalesceCompleteToolResultContinuation([
+      { role: "user", content: [result("t1")] },
+      { role: "assistant", content: [{ type: "text", text: "late" }] },
+    ], ["t1"])).toBeUndefined()
+  })
+})
+
+describe("findCompleteToolResultCheckpoint", () => {
+  const assistant = { role: "assistant", content: [{ type: "tool_use", id: "a" }, { type: "tool_use", id: "b" }] }
+  const result = (id: string) => ({ type: "tool_result", tool_use_id: id, content: id })
+
+  it("accepts only the exact immediate assistant checkpoint batch", () => {
+    expect(findCompleteToolResultCheckpoint([
+      { role: "user", content: "volatile old envelope" },
+      assistant,
+      { role: "user", content: [result("a"), result("b")] },
+    ], ["a", "b"])).toBeDefined()
+  })
+
+  it("rejects duplicate, extra, missing, and wrong-role result tails", () => {
+    expect(findCompleteToolResultCheckpoint([assistant, { role: "user", content: [result("a"), result("a")] }], ["a", "b"])).toBeUndefined()
+    expect(findCompleteToolResultCheckpoint([assistant, { role: "user", content: [result("a"), result("b"), result("extra")] }], ["a", "b"])).toBeUndefined()
+    expect(findCompleteToolResultCheckpoint([assistant, { role: "user", content: [result("a")] }], ["a", "b"])).toBeUndefined()
+    expect(findCompleteToolResultCheckpoint([assistant, { role: "assistant", content: [result("a"), result("b")] }], ["a", "b"])).toBeUndefined()
   })
 })

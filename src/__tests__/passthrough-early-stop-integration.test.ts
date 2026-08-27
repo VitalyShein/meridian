@@ -6,14 +6,27 @@
  * the hidden digest through a canonical result; only then is the assistant UUID
  * known durable enough for resumeSessionAt.
  */
-import { describe, it, expect, mock, beforeAll, beforeEach, afterEach } from "bun:test"
-import { assistantMessage, messageStart, textBlockStart, textDelta, toolUseBlockStart, inputJsonDelta, blockStop, messageDelta, messageStop } from "./helpers"
+import { describe, it, expect, mock, beforeAll, beforeEach, afterEach, afterAll } from "bun:test"
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { assistantMessage, messageStart, textBlockStart, textDelta, toolUseBlockStart, inputJsonDelta, blockStop, messageDelta, messageStop, resolveMockSdkSessionId } from "./helpers"
+
+interface LifecycleResourceSnapshot {
+  locator: { sessionId: string }
+  state: string
+}
 
 let mockMessages: any[] = []
 let yieldedCount = 0
 let capturedQueryParams: any = null
 let capturedQueryParamsAll: any[] = []
 let mockTerminalError: Error | undefined
+let forkSessionSequence = 0
+let mockBaseSessionId = "test-session"
+let mockReturnedSessionIdOverride: string | undefined
+let mockOmitReturnedSessionId = false
+const initialManagedSessionId = () => capturedQueryParamsAll[0]?.options?.sessionId ?? mockBaseSessionId
 
 mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   query: (params: any) => {
@@ -21,6 +34,8 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
     capturedQueryParamsAll.push(params)
     const terminalError = mockTerminalError
     const preHook = params?.options?.hooks?.PreToolUse?.[0]?.hooks?.[0]
+    const returnedSessionId = mockReturnedSessionIdOverride
+      ?? resolveMockSdkSessionId(params?.options, mockBaseSessionId)
     return (async function* () {
       let sawSyntheticDeny = false
       let sawResult = false
@@ -36,13 +51,18 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
           }
           continue
         }
-        if (msg?.type === "user" && msg?.message?.content?.some((b: any) => b?.type === "tool_result")) {
+        const { session_id: _ignoredSessionId, ...messageWithoutSessionId } = msg
+        const delivered = {
+          ...messageWithoutSessionId,
+          ...(mockOmitReturnedSessionId ? {} : { session_id: returnedSessionId }),
+        }
+        if (delivered?.type === "user" && delivered?.message?.content?.some((b: any) => b?.type === "tool_result")) {
           sawSyntheticDeny = true
         }
-        if (msg?.type === "result") sawResult = true
-        yield msg
-        if (preHook && msg?.type === "assistant" && Array.isArray(msg?.message?.content)) {
-          for (const block of msg.message.content) {
+        if (delivered?.type === "result") sawResult = true
+        yield delivered
+        if (preHook && delivered?.type === "assistant" && Array.isArray(delivered?.message?.content)) {
+          for (const block of delivered.message.content) {
             if (block?.type !== "tool_use") continue
             void Promise.resolve(preHook({
               tool_name: block.name,
@@ -59,7 +79,12 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
       // after tool-deny flows unless a fixture provided one explicitly.
       if (sawSyntheticDeny && !sawResult) {
         yieldedCount++
-        yield { type: "result", subtype: "success", is_error: false, session_id: "test-session" }
+        yield {
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          ...(mockOmitReturnedSessionId ? {} : { session_id: returnedSessionId }),
+        }
       }
     })()
   },
@@ -82,7 +107,7 @@ mock.module("../mcpTools", () => ({
 
 const { createProxyServer } = await import("../proxy/server")
 const { clearSessionCache } = await import("../proxy/session/cache")
-const { evictSharedSession } = await import("../proxy/sessionStore")
+const { evictSharedSession, lookupSharedSession, setSessionStoreDir } = await import("../proxy/sessionStore")
 const { telemetryStore } = await import("../telemetry")
 
 function userDenyMessage(toolUseId: string) {
@@ -99,6 +124,7 @@ function userDenyMessage(toolUseId: string) {
 }
 
 const TEST_RUN_ID = crypto.randomUUID()
+const TEST_SESSION_DIR = mkdtempSync(join(tmpdir(), "meridian-early-stop-"))
 
 const READ_TOOL = {
   name: "read",
@@ -107,6 +133,18 @@ const READ_TOOL = {
 }
 
 const usedSessionKeys = new Set<string>()
+
+async function waitForLifecycleState(sessionId: string, state: string): Promise<void> {
+  const deadline = Date.now() + 1_000
+  while (Date.now() < deadline) {
+    const sidecar = JSON.parse(readFileSync(join(TEST_SESSION_DIR, "session-gc.json"), "utf8"))
+    const resource = Object.values(sidecar.resources as Record<string, LifecycleResourceSnapshot>)
+      .find((candidate) => candidate.locator.sessionId === sessionId)
+    if (resource?.state === state) return
+    await Bun.sleep(10)
+  }
+  throw new Error(`lifecycle resource ${sessionId} did not reach ${state}`)
+}
 
 async function post(app: any, body: any, sessionHeader = "es-session", extraHeaders: Record<string, string> = {}) {
   const sessionKey = `${sessionHeader}-${TEST_RUN_ID}`
@@ -130,8 +168,14 @@ describe("Integration: passthrough early stop", () => {
   let savedEarlyStop: string | undefined
 
   beforeAll(() => {
+    setSessionStoreDir(TEST_SESSION_DIR)
     const { app: a } = createProxyServer({ port: 0, host: "127.0.0.1" })
     app = a
+  })
+
+  afterAll(() => {
+    setSessionStoreDir(null)
+    rmSync(TEST_SESSION_DIR, { recursive: true, force: true })
   })
 
   beforeEach(() => {
@@ -144,6 +188,10 @@ describe("Integration: passthrough early stop", () => {
     capturedQueryParams = null
     capturedQueryParamsAll = []
     mockTerminalError = undefined
+    forkSessionSequence = 0
+    mockBaseSessionId = `test-session-${crypto.randomUUID()}`
+    mockReturnedSessionIdOverride = undefined
+    mockOmitReturnedSessionId = false
   })
 
   afterEach(() => {
@@ -154,6 +202,35 @@ describe("Integration: passthrough early stop", () => {
     else delete process.env.MERIDIAN_PASSTHROUGH
     if (savedEarlyStop !== undefined) process.env.MERIDIAN_PASSTHROUGH_EARLY_STOP = savedEarlyStop
     else delete process.env.MERIDIAN_PASSTHROUGH_EARLY_STOP
+  })
+
+  it("replays and replaces a legacy user-denial boundary without a false conflict", async () => {
+    const sessionHeader = "es-legacy-upgrade"
+    const sessionKey = `${sessionHeader}-${TEST_RUN_ID}`
+    usedSessionKeys.add(sessionKey)
+    const now = Date.now()
+    writeFileSync(join(TEST_SESSION_DIR, "sessions.json"), JSON.stringify({
+      [sessionKey]: {
+        claudeSessionId: "legacy-sdk-session",
+        revision: 1,
+        createdAt: now,
+        lastUsedAt: now,
+        messageCount: 1,
+        lineageHash: "legacy-lineage",
+        passthroughResumeUuid: "legacy-user-denial-uuid",
+      },
+    }))
+    mockMessages = [assistantMessage([{ type: "text", text: "fresh replay" }])]
+
+    const response = await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: false,
+      messages: [{ role: "user", content: "continue after upgrade" }],
+    }, sessionHeader)
+    expect(response.status).toBe(200)
+    expect(capturedQueryParams.options.resume).toBeUndefined()
+    expect(lookupSharedSession(sessionKey)?.claudeSessionId).toBe(initialManagedSessionId())
   })
 
   it("non-stream: drains the hidden digest to a canonical result without leaking it", async () => {
@@ -217,7 +294,7 @@ describe("Integration: passthrough early stop", () => {
     }, "es-resume")
     expect(second.status).toBe(200)
     // Resume proof: the SDK was invoked with the stored session id.
-    expect(capturedQueryParams.options.resume).toBe("test-session")
+    expect(capturedQueryParams.options.resume).toBe(initialManagedSessionId())
   })
 
   it("non-stream: resumes at the assistant tool-use boundary with structured real results", async () => {
@@ -252,12 +329,12 @@ describe("Integration: passthrough early stop", () => {
 
     // resumeSessionAt only accepts SDKAssistantMessage UUIDs. The synthetic
     // user denial is a discarded side branch, not the canonical checkpoint.
-    expect(capturedQueryParams.options.resume).toBe("test-session")
+    expect(capturedQueryParams.options.resume).toBe(initialManagedSessionId())
     expect(capturedQueryParams.options.resumeSessionAt).toBe(assistantForkUuid)
     expect(capturedQueryParams.options.resumeSessionAt).not.toBe(syntheticDeny.uuid)
-    // Normal passthrough continuation reuses the session ID. Forking is for
-    // semantic branches (undo) or the bounded busy-session fallback only.
-    expect(capturedQueryParams.options.forkSession).toBeUndefined()
+    // The fork makes this rewind durable, replacing the persisted synthetic
+    // denial tail with the client's real result in the new transcript.
+    expect(capturedQueryParams.options.forkSession).toBe(true)
 
     const promptMessages: any[] = []
     for await (const message of capturedQueryParams.prompt) promptMessages.push(message)
@@ -268,7 +345,143 @@ describe("Integration: passthrough early stop", () => {
     ])
   })
 
-  it("non-stream: advances the assistant checkpoint across repeated tool rounds without forking", async () => {
+  it("non-stream: treats exact pending tool results as causal continuation despite envelope drift", async () => {
+    const assistantToolTurn = assistantMessage([
+      { type: "tool_use", id: "tu-envelope", name: "read", input: { file_path: "x" } },
+    ])
+    mockMessages = [assistantToolTurn, userDenyMessage("tu-envelope")]
+    expect((await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: false,
+      tools: [READ_TOOL],
+      messages: [{ role: "user", content: "read x" }],
+    }, "es-envelope-drift")).status).toBe(200)
+
+    mockMessages = [assistantMessage([{ type: "text", text: "done" }])]
+    const second = await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: false,
+      tools: [READ_TOOL],
+      messages: [
+        { role: "user", content: [{ type: "text", text: "inserted volatile prefix" }] },
+        { role: "user", content: [{ type: "text", text: "volatile envelope changed" }] },
+        { role: "assistant", content: [{ type: "tool_use", id: "tu-envelope", name: "read", input: { file_path: "x" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "tu-envelope", content: "hi" }] },
+      ],
+    }, "es-envelope-drift")
+    expect(second.status).toBe(200)
+    expect(capturedQueryParams.options.resume).toBe(initialManagedSessionId())
+    expect(capturedQueryParams.options.resumeSessionAt).toBe(assistantToolTurn.uuid)
+    expect(capturedQueryParams.options.forkSession).toBe(true)
+    const promptMessages: any[] = []
+    for await (const message of capturedQueryParams.prompt) promptMessages.push(message)
+    expect(promptMessages).toHaveLength(1)
+    expect(promptMessages[0].message.content).toEqual([
+      { type: "tool_result", tool_use_id: "tu-envelope", content: "hi" },
+    ])
+  })
+
+  it("non-stream: keeps the checkpoint when queued user text follows tool results", async () => {
+    const toolTurn = assistantMessage([
+      { type: "tool_use", id: "queued-tool", name: "read", input: { file_path: "x" } },
+    ])
+    mockMessages = [toolTurn, userDenyMessage("queued-tool")]
+    expect((await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: false,
+      tools: [READ_TOOL],
+      messages: [{ role: "user", content: "read x" }],
+    }, "es-queued-user")).status).toBe(200)
+
+    mockMessages = [assistantMessage([{ type: "text", text: "the file says X" }])]
+    expect((await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: false,
+      tools: [READ_TOOL],
+      messages: [
+        { role: "user", content: "read x" },
+        { role: "assistant", content: toolTurn.message.content },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "queued-tool", content: "X" }] },
+        { role: "user", content: "also summarize it" },
+      ],
+    }, "es-queued-user")).status).toBe(200)
+
+    const resumed = capturedQueryParamsAll[1]
+    expect(resumed.options.resume).toBe(initialManagedSessionId())
+    expect(resumed.options.resumeSessionAt).toBe(toolTurn.uuid)
+    const promptMessages: any[] = []
+    for await (const message of resumed.prompt) promptMessages.push(message)
+    expect(promptMessages).toHaveLength(1)
+    expect(promptMessages[0].message.content).toEqual([
+      { type: "tool_result", tool_use_id: "queued-tool", content: "X" },
+      { type: "text", text: "also summarize it" },
+    ])
+  })
+
+  it("stream: keeps the checkpoint when queued user text follows tool results", async () => {
+    const toolTurn = assistantMessage([
+      { type: "tool_use", id: "queued-stream-tool", name: "read", input: { file_path: "x" } },
+    ])
+    mockMessages = [
+      messageStart("msg_queued_stream"),
+      toolUseBlockStart(0, "read", "queued-stream-tool"),
+      inputJsonDelta(0, '{"file_path":"x"}'),
+      blockStop(0),
+      messageDelta("tool_use"),
+      toolTurn,
+      userDenyMessage("queued-stream-tool"),
+    ]
+    const first = await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: true,
+      tools: [READ_TOOL],
+      messages: [{ role: "user", content: "read x" }],
+    }, "es-queued-stream-user")
+    expect(first.status).toBe(200)
+    await first.text()
+
+    mockMessages = [
+      messageStart("msg_queued_stream_reply"),
+      textBlockStart(0),
+      textDelta(0, "the file says X"),
+      blockStop(0),
+      messageDelta("end_turn"),
+      messageStop(),
+      assistantMessage([{ type: "text", text: "the file says X" }]),
+    ]
+    const second = await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: true,
+      tools: [READ_TOOL],
+      messages: [
+        { role: "user", content: "read x" },
+        { role: "assistant", content: toolTurn.message.content },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "queued-stream-tool", content: "X" }] },
+        { role: "user", content: "also summarize it" },
+      ],
+    }, "es-queued-stream-user")
+    expect(second.status).toBe(200)
+    await second.text()
+
+    const resumed = capturedQueryParamsAll[1]
+    expect(resumed.options.resume).toBe(initialManagedSessionId())
+    expect(resumed.options.resumeSessionAt).toBe(toolTurn.uuid)
+    const promptMessages: any[] = []
+    for await (const message of resumed.prompt) promptMessages.push(message)
+    expect(promptMessages).toHaveLength(1)
+    expect(promptMessages[0].message.content).toEqual([
+      { type: "tool_result", tool_use_id: "queued-stream-tool", content: "X" },
+      { type: "text", text: "also summarize it" },
+    ])
+  })
+
+  it("non-stream: forks every repeated checkpoint resume so delivered results replace deny tails", async () => {
     const firstToolTurn = assistantMessage([
       { type: "tool_use", id: "tu-round-1", name: "read", input: { file_path: "a" } },
     ])
@@ -297,16 +510,34 @@ describe("Integration: passthrough early stop", () => {
       ],
     }, "es-repeated-boundary")).status).toBe(200)
     const secondQuery = capturedQueryParamsAll[1]
-    expect(secondQuery.options.resume).toBe("test-session")
+    expect(secondQuery.options.resume).toBe(initialManagedSessionId())
     expect(secondQuery.options.resumeSessionAt).toBe(firstToolTurn.uuid)
-    expect(secondQuery.options.forkSession).toBeUndefined()
+    // resumeSessionAt alone rewinds only for this query. The source transcript
+    // still ends in the persisted PreToolUse denial, so a later resume from the
+    // newly produced assistant UUID serializes that marker in place of result A.
+    // Forking makes the rewind durable: the new transcript appends result A and
+    // subsequent assistant turns descend from the real client result.
+    expect(secondQuery.options.forkSession).toBe(true)
+    expect(secondQuery.options.sessionId).toMatch(/^[0-9a-f-]{36}$/)
+    const storedSecond = lookupSharedSession(`es-repeated-boundary-${TEST_RUN_ID}`)
+    expect(storedSecond?.claudeSessionId).toBe(secondQuery.options.sessionId)
+    expect(storedSecond?.previousClaudeSessionId).toBe(initialManagedSessionId())
+    expect(storedSecond?.currentTranscript?.sessionId).toBe(secondQuery.options.sessionId)
+    expect(storedSecond?.previousTranscript?.sessionId).toBe(initialManagedSessionId())
+    const secondSidecar = JSON.parse(readFileSync(join(TEST_SESSION_DIR, "session-gc.json"), "utf8"))
+    const targetResource = Object.values(secondSidecar.resources as Record<string, any>)
+      .find((resource) => resource.locator.sessionId === secondQuery.options.sessionId)
+    expect(targetResource?.state).toBe("live")
     const secondPrompt: any[] = []
     for await (const message of secondQuery.prompt) secondPrompt.push(message)
     expect(secondPrompt[0].message.content).toEqual([
       { type: "tool_result", tool_use_id: "tu-round-1", content: "A" },
     ])
 
-    mockMessages = [assistantMessage([{ type: "text", text: "done" }])]
+    const thirdToolTurn = assistantMessage([
+      { type: "tool_use", id: "tu-round-3", name: "read", input: { file_path: "c" } },
+    ])
+    mockMessages = [thirdToolTurn, userDenyMessage("tu-round-3")]
     expect((await post(app, {
       model: "claude-sonnet-4-5",
       max_tokens: 400,
@@ -321,14 +552,198 @@ describe("Integration: passthrough early stop", () => {
       ],
     }, "es-repeated-boundary")).status).toBe(200)
     const thirdQuery = capturedQueryParamsAll[2]
-    expect(thirdQuery.options.resume).toBe("test-session")
+    expect(thirdQuery.options.resume).toBe(secondQuery.options.sessionId)
     expect(thirdQuery.options.resumeSessionAt).toBe(secondToolTurn.uuid)
-    expect(thirdQuery.options.forkSession).toBeUndefined()
+    // Every tool boundary has its own synthetic denial tail. Repeating the fork
+    // is what keeps result B durable as the chain grows beyond three resumes.
+    expect(thirdQuery.options.forkSession).toBe(true)
+    expect(thirdQuery.options.sessionId).not.toBe(secondQuery.options.sessionId)
     const thirdPrompt: any[] = []
     for await (const message of thirdQuery.prompt) thirdPrompt.push(message)
     expect(thirdPrompt[0].message.content).toEqual([
       { type: "tool_result", tool_use_id: "tu-round-2", content: "B" },
     ])
+
+    mockMessages = [assistantMessage([{ type: "text", text: "done" }])]
+    expect((await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: false,
+      tools: [READ_TOOL],
+      messages: [
+        { role: "user", content: "read a" },
+        { role: "assistant", content: [{ type: "tool_use", id: "tu-round-1", name: "read", input: { file_path: "a" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "tu-round-1", content: "A" }] },
+        { role: "assistant", content: [{ type: "tool_use", id: "tu-round-2", name: "read", input: { file_path: "b" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "tu-round-2", content: "B" }] },
+        { role: "assistant", content: [{ type: "tool_use", id: "tu-round-3", name: "read", input: { file_path: "c" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "tu-round-3", content: "C" }] },
+      ],
+    }, "es-repeated-boundary")).status).toBe(200)
+    const fourthQuery = capturedQueryParamsAll[3]
+    expect(fourthQuery.options.resume).toBe(thirdQuery.options.sessionId)
+    expect(fourthQuery.options.resumeSessionAt).toBe(thirdToolTurn.uuid)
+    expect(fourthQuery.options.forkSession).toBe(true)
+    const fourthPrompt: any[] = []
+    for await (const message of fourthQuery.prompt) fourthPrompt.push(message)
+    expect(fourthPrompt[0].message.content).toEqual([
+      { type: "tool_result", tool_use_id: "tu-round-3", content: "C" },
+    ])
+  })
+
+
+  it("non-stream: rejects a fresh SDK session ID contradiction and retires both identities", async () => {
+    const wrongSessionId = `wrong-fresh-${crypto.randomUUID()}`
+    mockReturnedSessionIdOverride = wrongSessionId
+    mockMessages = [assistantMessage([{ type: "text", text: "must not publish" }])]
+
+    const response = await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: false,
+      messages: [{ role: "user", content: "fresh id mismatch" }],
+    }, "es-fresh-id-mismatch")
+    expect(response.status).toBe(500)
+    expect(await response.text()).toContain("Managed SDK fork returned")
+
+    const targetId = capturedQueryParamsAll[0]?.options?.sessionId
+    expect(targetId).toMatch(/^[0-9a-f-]{36}$/)
+    expect(lookupSharedSession(`es-fresh-id-mismatch-${TEST_RUN_ID}`)).toBeUndefined()
+    const sidecar = JSON.parse(readFileSync(join(TEST_SESSION_DIR, "session-gc.json"), "utf8"))
+    const resources = Object.values(sidecar.resources as Record<string, LifecycleResourceSnapshot>)
+    expect(resources.find((resource) => resource.locator.sessionId === targetId)?.state).toBe("retired")
+    expect(resources.find((resource) => resource.locator.sessionId === wrongSessionId)?.state).toBe("retired")
+  })
+
+  it("stream: rejects a fresh SDK session ID contradiction without publishing it", async () => {
+    const wrongSessionId = `wrong-fresh-stream-${crypto.randomUUID()}`
+    mockReturnedSessionIdOverride = wrongSessionId
+    mockMessages = [assistantMessage([{ type: "text", text: "must not publish" }])]
+
+    const response = await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: true,
+      messages: [{ role: "user", content: "fresh stream id mismatch" }],
+    }, "es-fresh-stream-id-mismatch")
+    expect(response.status).toBe(200)
+    const body = await response.text()
+    expect(body).toContain("event: error")
+    expect(body).not.toContain("must not publish")
+    expect(lookupSharedSession(`es-fresh-stream-id-mismatch-${TEST_RUN_ID}`)).toBeUndefined()
+
+    const targetId = capturedQueryParamsAll[0]?.options?.sessionId
+    await waitForLifecycleState(targetId, "retired")
+    const sidecar = JSON.parse(readFileSync(join(TEST_SESSION_DIR, "session-gc.json"), "utf8"))
+    const resources = Object.values(sidecar.resources as Record<string, LifecycleResourceSnapshot>)
+    expect(resources.find((resource) => resource.locator.sessionId === targetId)?.state).toBe("retired")
+    expect(resources.find((resource) => resource.locator.sessionId === wrongSessionId)?.state).toBe("retired")
+  })
+
+  it("non-stream: rejects an SDK fork ID mismatch without advancing the shared mapping", async () => {
+    const toolTurn = assistantMessage([
+      { type: "tool_use", id: "tu-id-mismatch", name: "read", input: { file_path: "a" } },
+    ])
+    mockMessages = [toolTurn, userDenyMessage("tu-id-mismatch")]
+    expect((await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: false,
+      tools: [READ_TOOL],
+      messages: [{ role: "user", content: "read for mismatch" }],
+    }, "es-managed-id-mismatch")).status).toBe(200)
+
+    // Keep 503 inside the opaque ID so this also proves error classification
+    // does not mistake random UUID digits for an HTTP overload response.
+    const wrongSessionId = "wrong-00000000-0000-4503-8000-000000000000"
+    mockReturnedSessionIdOverride = wrongSessionId
+    mockMessages = [assistantMessage([{ type: "text", text: "must not publish" }])]
+    const response = await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: false,
+      tools: [READ_TOOL],
+      messages: [
+        { role: "user", content: "read for mismatch" },
+        { role: "assistant", content: toolTurn.message.content },
+        { role: "user", content: [
+          { type: "tool_result", tool_use_id: "tu-id-mismatch", content: "A" },
+        ] },
+      ],
+    }, "es-managed-id-mismatch")
+    expect(response.status).toBe(500)
+    expect(await response.text()).toContain("Managed SDK fork returned")
+
+    const managedQuery = capturedQueryParamsAll[1]
+    const targetId = managedQuery.options.sessionId
+    expect(targetId).toMatch(/^[0-9a-f-]{36}$/)
+    const stored = lookupSharedSession(`es-managed-id-mismatch-${TEST_RUN_ID}`)
+    expect(stored?.claudeSessionId).toBe(initialManagedSessionId())
+    expect(stored?.previousClaudeSessionId).toBeUndefined()
+    const sidecar = JSON.parse(readFileSync(join(TEST_SESSION_DIR, "session-gc.json"), "utf8"))
+    const resources = Object.values(sidecar.resources as Record<string, LifecycleResourceSnapshot>)
+    const target = resources.find((resource) => resource.locator.sessionId === targetId)
+    const unexpected = resources.find((resource) => resource.locator.sessionId === wrongSessionId)
+    expect(target?.state).toBe("retired")
+    expect(unexpected?.state).toBe("retired")
+  })
+
+  it("non-stream: rejects a managed fork that completes without a session ID", async () => {
+    const toolTurn = assistantMessage([
+      { type: "tool_use", id: "tu-id-missing", name: "read", input: { file_path: "a" } },
+    ])
+    mockMessages = [toolTurn, userDenyMessage("tu-id-missing")]
+    expect((await post(app, {
+      model: "claude-sonnet-4-5", max_tokens: 400, stream: false, tools: [READ_TOOL],
+      messages: [{ role: "user", content: "read without returned id" }],
+    }, "es-managed-id-missing")).status).toBe(200)
+
+    mockOmitReturnedSessionId = true
+    mockMessages = [assistantMessage([{ type: "text", text: "must not publish" }])]
+    const response = await post(app, {
+      model: "claude-sonnet-4-5", max_tokens: 400, stream: false, tools: [READ_TOOL],
+      messages: [
+        { role: "user", content: "read without returned id" },
+        { role: "assistant", content: toolTurn.message.content },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "tu-id-missing", content: "A" }] },
+      ],
+    }, "es-managed-id-missing")
+    expect(response.status).toBe(500)
+    expect(await response.text()).toContain("no session ID")
+    expect(lookupSharedSession(`es-managed-id-missing-${TEST_RUN_ID}`)?.claudeSessionId).toBe(initialManagedSessionId())
+  })
+
+  it("stream: rejects a managed fork that completes without a session ID", async () => {
+    const toolTurn = assistantMessage([
+      { type: "tool_use", id: "tu-stream-id-missing", name: "read", input: { file_path: "a" } },
+    ])
+    mockMessages = [toolTurn, userDenyMessage("tu-stream-id-missing")]
+    const first = await post(app, {
+      model: "claude-sonnet-4-5", max_tokens: 400, stream: true, tools: [READ_TOOL],
+      messages: [{ role: "user", content: "stream read without returned id" }],
+    }, "es-stream-managed-id-missing")
+    expect(first.status).toBe(200)
+    await first.text()
+
+    mockOmitReturnedSessionId = true
+    mockMessages = [assistantMessage([{ type: "text", text: "must not publish" }])]
+    const response = await post(app, {
+      model: "claude-sonnet-4-5", max_tokens: 400, stream: true, tools: [READ_TOOL],
+      messages: [
+        { role: "user", content: "stream read without returned id" },
+        { role: "assistant", content: toolTurn.message.content },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "tu-stream-id-missing", content: "A" }] },
+      ],
+    }, "es-stream-managed-id-missing")
+    expect(response.status).toBe(200)
+    expect(await response.text()).not.toContain("must not publish")
+    expect(lookupSharedSession(`es-stream-managed-id-missing-${TEST_RUN_ID}`)?.claudeSessionId).toBe(initialManagedSessionId())
+    const targetId = capturedQueryParamsAll[1].options.sessionId
+    await waitForLifecycleState(targetId, "retired")
+    const sidecar = JSON.parse(readFileSync(join(TEST_SESSION_DIR, "session-gc.json"), "utf8"))
+    const target = Object.values(sidecar.resources as Record<string, any>)
+      .find((resource) => resource.locator.sessionId === targetId)
+    expect(target == null || target.state === "retired" || target.state === "tombstoned").toBe(true)
   })
 
   it("non-stream: falls back to a fresh replay for partial parallel results", async () => {
@@ -360,6 +775,39 @@ describe("Integration: passthrough early stop", () => {
     expect(capturedQueryParams.options.resume).toBeUndefined()
     expect(capturedQueryParams.options.resumeSessionAt).toBeUndefined()
     expect(typeof capturedQueryParams.prompt).toBe("string")
+  })
+
+  it("non-stream: preserves queued user text when partial results force a fresh replay", async () => {
+    const toolTurn = assistantMessage([
+      { type: "tool_use", id: "partial-queued-1", name: "read", input: { file_path: "a" } },
+      { type: "tool_use", id: "partial-queued-2", name: "read", input: { file_path: "b" } },
+    ])
+    mockMessages = [toolTurn, userDenyMessage("partial-queued-1"), userDenyMessage("partial-queued-2")]
+    expect((await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: false,
+      tools: [READ_TOOL],
+      messages: [{ role: "user", content: "read both" }],
+    }, "es-partial-queued-results")).status).toBe(200)
+
+    mockMessages = [assistantMessage([{ type: "text", text: "safe replay" }])]
+    expect((await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: false,
+      tools: [READ_TOOL],
+      messages: [
+        { role: "user", content: "read both" },
+        { role: "assistant", content: toolTurn.message.content },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "partial-queued-1", content: "A" }] },
+        { role: "user", content: "keep this queued" },
+      ],
+    }, "es-partial-queued-results")).status).toBe(200)
+    expect(capturedQueryParams.options.resume).toBeUndefined()
+    expect(capturedQueryParams.options.resumeSessionAt).toBeUndefined()
+    expect(typeof capturedQueryParams.prompt).toBe("string")
+    expect(capturedQueryParams.prompt).toContain("keep this queued")
   })
 
   it("non-stream: preserves a nested multimodal tool_result wrapper", async () => {
@@ -399,7 +847,7 @@ describe("Integration: passthrough early stop", () => {
     ])
   })
 
-  it("non-stream: maps parallel SDK fragments to one final undo UUID", async () => {
+  it("non-stream: drops copied rollback UUIDs after a checkpoint fork", async () => {
     const firstFragment = assistantMessage([
       { type: "tool_use", id: "undo-parallel-1", name: "read", input: { file_path: "a" } },
     ])
@@ -421,7 +869,8 @@ describe("Integration: passthrough early stop", () => {
       messages: [{ role: "user", content: "read both for undo" }],
     }, "es-parallel-undo")).status).toBe(200)
 
-    mockMessages = [assistantMessage([{ type: "text", text: "both read" }])]
+    const forkOutput = assistantMessage([{ type: "text", text: "both read" }])
+    mockMessages = [forkOutput]
     expect((await post(app, {
       model: "claude-sonnet-4-5",
       max_tokens: 400,
@@ -437,9 +886,11 @@ describe("Integration: passthrough early stop", () => {
       ],
     }, "es-parallel-undo")).status).toBe(200)
     expect(capturedQueryParams.options.resumeSessionAt).toBe(finalFragment.uuid)
-    expect(capturedQueryParams.options.forkSession).toBeUndefined()
+    expect(capturedQueryParams.options.forkSession).toBe(true)
+    const forkSessionId = capturedQueryParams.options.sessionId
+    expect(forkSessionId).toMatch(/^[0-9a-f-]{36}$/)
 
-    mockMessages = [assistantMessage([{ type: "text", text: "changed direction" }])]
+    mockMessages = [assistantMessage([{ type: "text", text: "continued" }])]
     expect((await post(app, {
       model: "claude-sonnet-4-5",
       max_tokens: 400,
@@ -448,14 +899,39 @@ describe("Integration: passthrough early stop", () => {
       messages: [
         { role: "user", content: "read both for undo" },
         { role: "assistant", content: combinedToolTurn },
-        { role: "user", content: "instead, take a different direction" },
+        { role: "user", content: [
+          { type: "tool_result", tool_use_id: "undo-parallel-1", content: "A" },
+          { type: "tool_result", tool_use_id: "undo-parallel-2", content: "B" },
+        ] },
+        { role: "assistant", content: forkOutput.message.content },
+        { role: "user", content: "continue after the fork" },
       ],
     }, "es-parallel-undo")).status).toBe(200)
-    expect(capturedQueryParams.options.resumeSessionAt).toBe(finalFragment.uuid)
+    expect(capturedQueryParams.options.resume).toBe(forkSessionId)
+    expect(capturedQueryParams.options.resumeSessionAt).toBeUndefined()
     expect(capturedQueryParams.options.forkSession).toBe(true)
 
-    // The first undo must retain UUIDs for the preserved prefix so another
-    // branch from that prefix still rolls back to the final parallel fragment.
+    const rewrittenBranch = [
+      { role: "user", content: "read both for undo" },
+      { role: "assistant", content: combinedToolTurn },
+      { role: "user", content: "instead, take a different direction" },
+      { role: "assistant", content: [{ type: "text", text: "branch draft" }] },
+      { role: "user", content: "rewrite this branch" },
+    ]
+    mockMessages = [assistantMessage([{ type: "text", text: "changed direction" }])]
+    expect((await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: false,
+      tools: [READ_TOOL],
+      messages: rewrittenBranch,
+    }, "es-parallel-undo")).status).toBe(200)
+    expect(capturedQueryParams.options.resume).toBeUndefined()
+    expect(capturedQueryParams.options.resumeSessionAt).toBeUndefined()
+    expect(capturedQueryParams.options.forkSession).toBeUndefined()
+
+    // The fresh replay above has the same message count as the cached fork
+    // continuation. It must not inherit forkOutput.uuid from the older slot.
     mockMessages = [assistantMessage([{ type: "text", text: "changed again" }])]
     expect((await post(app, {
       model: "claude-sonnet-4-5",
@@ -463,13 +939,13 @@ describe("Integration: passthrough early stop", () => {
       stream: false,
       tools: [READ_TOOL],
       messages: [
-        { role: "user", content: "read both for undo" },
-        { role: "assistant", content: combinedToolTurn },
-        { role: "user", content: "take yet another direction" },
+        ...rewrittenBranch.slice(0, 4),
+        { role: "user", content: "rewrite this branch again" },
       ],
     }, "es-parallel-undo")).status).toBe(200)
-    expect(capturedQueryParams.options.resumeSessionAt).toBe(finalFragment.uuid)
-    expect(capturedQueryParams.options.forkSession).toBe(true)
+    expect(capturedQueryParams.options.resume).toBeUndefined()
+    expect(capturedQueryParams.options.resumeSessionAt).toBeUndefined()
+    expect(capturedQueryParams.options.forkSession).toBeUndefined()
   })
 
   it("non-stream: a plain resume with no deny boundary stays bare", async () => {
@@ -498,7 +974,7 @@ describe("Integration: passthrough early stop", () => {
       ],
     }, "es-no-boundary")
     expect(second.status).toBe(200)
-    expect(capturedQueryParams.options.resume).toBe("test-session")
+    expect(capturedQueryParams.options.resume).toBe(initialManagedSessionId())
     expect(capturedQueryParams.prompt).toBe("and again")
   })
 
@@ -614,7 +1090,7 @@ describe("Integration: passthrough early stop", () => {
       ],
     }, "es-hidden-hook-race")
     expect(second.status).toBe(200)
-    expect(capturedQueryParamsAll[1].options.resume).toBe("test-session")
+    expect(capturedQueryParamsAll[1].options.resume).toBe(initialManagedSessionId())
     expect(capturedQueryParamsAll[1].options.resumeSessionAt).toBe(visibleTurn.uuid)
     expect(capturedQueryParamsAll[1].options.resumeSessionAt).not.toBe(hiddenTurn.uuid)
   })
@@ -650,7 +1126,7 @@ describe("Integration: passthrough early stop", () => {
     }, "es-kill-switch-undo")).status).toBe(200)
     expect(capturedQueryParams.options.resumeSessionAt).toBe(visibleToolTurn.uuid)
     expect(capturedQueryParams.options.resumeSessionAt).not.toBe(hiddenDigestTurn.uuid)
-    expect(capturedQueryParams.options.forkSession).toBeUndefined()
+    expect(capturedQueryParams.options.forkSession).toBe(true)
   })
 
   it("stream: waits for late parallel assistant metadata before freezing the checkpoint", async () => {
@@ -706,8 +1182,110 @@ describe("Integration: passthrough early stop", () => {
       ],
     }, "es-late-parallel")
     expect(second.status).toBe(200)
-    expect(capturedQueryParamsAll[1].options.resume).toBe("test-session")
+    expect(capturedQueryParamsAll[1].options.resume).toBe(initialManagedSessionId())
     expect(capturedQueryParamsAll[1].options.resumeSessionAt).toBe(finalFragment.uuid)
+  })
+
+  // The non-stream counterpart of the late-parallel-metadata case above.
+  // Passthrough asks for partial messages on both paths, so non-stream has the
+  // same turn boundary AND the same hazard: after message_delta the tracker
+  // knows only the calls whose assistant fragments it has consumed, and a deny
+  // arriving before the final fragment settles that partial set. Freezing there
+  // hands the client a SUBSET of what the model called — the calls past the
+  // checkpoint are dropped, not replayed, so nothing on the wire looks wrong.
+  it("non-stream: waits for late parallel assistant metadata before freezing the checkpoint", async () => {
+    const firstFragment = assistantMessage([
+      { type: "tool_use", id: "ns-late-1", name: "read", input: { file_path: "a" } },
+    ])
+    const finalFragment = assistantMessage([
+      { type: "tool_use", id: "ns-late-2", name: "read", input: { file_path: "b" } },
+    ])
+    mockMessages = [
+      messageStart("msg_ns_late_parallel"),
+      toolUseBlockStart(0, "read", "ns-late-1"),
+      inputJsonDelta(0, '{"file_path":"a"}'),
+      blockStop(0),
+      toolUseBlockStart(1, "read", "ns-late-2"),
+      inputJsonDelta(1, '{"file_path":"b"}'),
+      blockStop(1),
+      messageDelta("tool_use"),
+      { type: "test_pre_tool_hook", tool_name: "read", tool_use_id: "ns-late-1", tool_input: { file_path: "a" } },
+      { type: "test_pre_tool_hook", tool_name: "read", tool_use_id: "ns-late-2", tool_input: { file_path: "b" } },
+      firstFragment,
+      userDenyMessage("ns-late-1"),
+      userDenyMessage("ns-late-2"),
+      // Both results can arrive before the last assistant metadata fragment.
+      // Settlement must recheck after this fragment extends the expected set.
+      finalFragment,
+    ]
+
+    const res = await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: false,
+      tools: [READ_TOOL],
+      messages: [{ role: "user", content: "read a and b" }],
+    }, "es-ns-late-parallel")
+    expect(res.status).toBe(200)
+    const body = await res.json() as { content: Array<{ type: string; id?: string }> }
+    const toolUses = body.content.filter((block) => block.type === "tool_use")
+    expect(toolUses.map((toolUse) => toolUse.id).sort()).toEqual(["ns-late-1", "ns-late-2"])
+
+    mockMessages = [assistantMessage([{ type: "text", text: "both complete" }])]
+    const second = await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: false,
+      tools: [READ_TOOL],
+      messages: [
+        { role: "user", content: "read a and b" },
+        { role: "assistant", content: toolUses },
+        { role: "user", content: [
+          { type: "tool_result", tool_use_id: "ns-late-1", content: "A" },
+          { type: "tool_result", tool_use_id: "ns-late-2", content: "B" },
+        ] },
+      ],
+    }, "es-ns-late-parallel")
+    expect(second.status).toBe(200)
+    expect(capturedQueryParamsAll[1].options.resumeSessionAt).toBe(finalFragment.uuid)
+    expect(capturedQueryParamsAll[1].options.forkSession).toBe(true)
+  })
+
+  // The other half of the same gate. Above, the tracker lags the wire; here it
+  // matches it exactly — but only because the turn has not finished emitting.
+  // Settling on that agreement mid-generation freezes the checkpoint before the
+  // remaining blocks exist, so the completeness oracle alone is not sufficient:
+  // generation must also have ended.
+  it("non-stream: does not freeze when the tracker matches the wire mid-generation", async () => {
+    mockMessages = [
+      messageStart("msg_ns_midgen"),
+      toolUseBlockStart(0, "read", "ns-mid-1"),
+      inputJsonDelta(0, '{"file_path":"a"}'),
+      blockStop(0),
+      // Armed and settled while the turn is still generating: at this point
+      // expected and the streamed set agree on exactly {ns-mid-1}.
+      assistantMessage([{ type: "tool_use", id: "ns-mid-1", name: "read", input: { file_path: "a" } }]),
+      userDenyMessage("ns-mid-1"),
+      // ...and only now does the second call reach the wire.
+      toolUseBlockStart(1, "read", "ns-mid-2"),
+      inputJsonDelta(1, '{"file_path":"b"}'),
+      blockStop(1),
+      messageDelta("tool_use"),
+      assistantMessage([{ type: "tool_use", id: "ns-mid-2", name: "read", input: { file_path: "b" } }]),
+      userDenyMessage("ns-mid-2"),
+    ]
+
+    const res = await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: false,
+      tools: [READ_TOOL],
+      messages: [{ role: "user", content: "read a and b" }],
+    }, "es-ns-midgen")
+    expect(res.status).toBe(200)
+    const body = await res.json() as { content: Array<{ type: string; id?: string }> }
+    const toolUses = body.content.filter((block) => block.type === "tool_use")
+    expect(toolUses.map((toolUse) => toolUse.id).sort()).toEqual(["ns-mid-1", "ns-mid-2"])
   })
 
   // #742: a deny can become iterator-visible while a later tool_use block is
@@ -942,7 +1520,7 @@ describe("Integration: passthrough early stop", () => {
       ],
     }, "es-single-turn-boundary")
     expect(second.status).toBe(200)
-    expect(capturedQueryParamsAll[1].options.resume).toBe("test-session")
+    expect(capturedQueryParamsAll[1].options.resume).toBe(initialManagedSessionId())
     expect(capturedQueryParamsAll[1].options.resumeSessionAt).toBe(toolTurn.uuid)
   })
 
@@ -992,8 +1570,79 @@ describe("Integration: passthrough early stop", () => {
       ],
     }, "es-capped-stream")
     expect(second.status).toBe(200)
-    expect(capturedQueryParamsAll[1].options.resume).toBe("test-session")
+    expect(capturedQueryParamsAll[1].options.resume).toBe(initialManagedSessionId())
     expect(capturedQueryParamsAll[1].options.resumeSessionAt).toBe(toolTurn.uuid)
+  })
+
+  it("stream: a capped checkpoint fork does not store parent rollback UUIDs", async () => {
+    const parentToolTurn = assistantMessage([
+      { type: "tool_use", id: "capped-fork-parent", name: "read", input: { file_path: "parent" } },
+    ])
+    mockMessages = [parentToolTurn, userDenyMessage("capped-fork-parent")]
+    expect((await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: false,
+      tools: [READ_TOOL],
+      messages: [{ role: "user", content: "read parent then child" }],
+    }, "es-capped-fork-map")).status).toBe(200)
+
+    const forkToolTurn = assistantMessage([
+      { type: "tool_use", id: "capped-fork-child", name: "read", input: { file_path: "child" } },
+    ])
+    mockMessages = [
+      messageStart("msg_capped_fork_child"),
+      toolUseBlockStart(0, "read", "capped-fork-child"),
+      inputJsonDelta(0, '{"file_path":"child"}'),
+      blockStop(0),
+      messageDelta("tool_use"),
+      forkToolTurn,
+      userDenyMessage("capped-fork-child"),
+      { type: "result", subtype: "error_max_turns", is_error: true },
+    ]
+    mockTerminalError = new Error("Claude Code returned an error result: Reached maximum number of turns (1)")
+    const forkRequestId = `capped-fork-map-${TEST_RUN_ID}`
+    const forked = await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: true,
+      tools: [READ_TOOL],
+      messages: [
+        { role: "user", content: "read parent then child" },
+        { role: "assistant", content: parentToolTurn.message.content },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "capped-fork-parent", content: "P" }] },
+      ],
+    }, "es-capped-fork-map", { "x-request-id": forkRequestId })
+    expect(forked.status).toBe(200)
+    expect(await forked.text()).toContain('"type":"tool_use"')
+    expect(capturedQueryParamsAll[1].options.resume).toBe(initialManagedSessionId())
+    expect(capturedQueryParamsAll[1].options.resumeSessionAt).toBe(parentToolTurn.uuid)
+    expect(capturedQueryParamsAll[1].options.forkSession).toBe(true)
+    let forkRow: any
+    for (let i = 0; i < 500 && !forkRow; i++) {
+      forkRow = telemetryStore.getRecent({ limit: 200 }).find((row: any) => row.requestId === forkRequestId)
+      if (!forkRow) await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    expect(forkRow).toBeDefined()
+
+    mockTerminalError = undefined
+    mockMessages = [assistantMessage([{ type: "text", text: "fresh branch" }])]
+    expect((await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: false,
+      tools: [READ_TOOL],
+      messages: [
+        { role: "user", content: "read parent then child" },
+        { role: "assistant", content: parentToolTurn.message.content },
+        { role: "user", content: [
+          { type: "tool_result", tool_use_id: "capped-fork-parent", content: "different parent result" },
+        ] },
+      ],
+    }, "es-capped-fork-map")).status).toBe(200)
+    expect(capturedQueryParamsAll[2].options.resume).toBeUndefined()
+    expect(capturedQueryParamsAll[2].options.resumeSessionAt).toBeUndefined()
+    expect(capturedQueryParamsAll[2].options.forkSession).toBeUndefined()
   })
 
   it("non-stream: stores the checkpoint at the capped stop so the next turn resumes", async () => {
@@ -1033,7 +1682,7 @@ describe("Integration: passthrough early stop", () => {
       ],
     }, "es-capped-nonstream")
     expect(second.status).toBe(200)
-    expect(capturedQueryParamsAll[1].options.resume).toBe("test-session")
+    expect(capturedQueryParamsAll[1].options.resume).toBe(initialManagedSessionId())
     expect(capturedQueryParamsAll[1].options.resumeSessionAt).toBe(toolTurn.uuid)
   })
 
@@ -1195,7 +1844,7 @@ describe("Integration: passthrough early stop", () => {
   // ADVERSARIAL: the cap makes max_turns the ordinary terminal state, so a turn
   // that trips it with NOTHING captured must still produce a usable envelope.
   // This is reachable: a thinking-only turn makes the CLI take another turn for
-  // its no-visible-output nudge (audit-token-spend.mjs counts these), and under
+  // its no-visible-output nudge, and under
   // the cap that turn is refused. Before the cap it could not happen, because
   // the SDK had budget to finish. A 500 here is a hard user-visible regression.
   it("stream: a capped turn that captured no tool call does not fail the request", async () => {
@@ -1267,7 +1916,7 @@ describe("Integration: passthrough early stop", () => {
     expect(capturedQueryParamsAll[0].options.maxTurns).toBe(1)
   })
 
-  it("stream: closes at turn 1 while digest and canonical result drain invisibly", async () => {
+  it("stream: withholds the terminal tool checkpoint until the canonical drain is published", async () => {
     mockMessages = [
       messageStart("msg_es"),
       toolUseBlockStart(0, "read", "tu1"),
@@ -1276,8 +1925,8 @@ describe("Integration: passthrough early stop", () => {
       messageDelta("tool_use"),
       assistantMessage([{ type: "tool_use", id: "tu1", name: "read", input: { file_path: "x" } }]),
       userDenyMessage("tu1"),
-      // Hidden digest wire events are consumed but never enqueued after the
-      // client controller closes. A closed enqueue must not break the drain.
+      // Hidden digest wire events are consumed but never enqueued. The terminal
+      // pair is withheld until the exact managed target is durable.
       messageStart("msg_turn2"),
       textBlockStart(0),
       textDelta(0, "TURN2_GARBAGE_DIGEST"),
@@ -1301,13 +1950,73 @@ describe("Integration: passthrough early stop", () => {
     expect(text).toContain("message_stop")
     expect(text).not.toContain("TURN2_GARBAGE_DIGEST")
 
-    // The client response completes at turn 1; digest/result draining continues
-    // in the background and must not abort the SDK query.
+    const durable = lookupSharedSession(`es-session-${TEST_RUN_ID}`)
+    expect(durable?.claudeSessionId).toBe(capturedQueryParams.options.sessionId)
+    expect(durable?.passthroughToolCallIds).toEqual(["tu1"])
+
+    // Receiving message_stop proves digest/result draining and target
+    // publication already completed.
     const deadline = Date.now() + 2000
     while (yieldedCount < 15 && Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 10))
     }
     expect(capturedQueryParams.options.abortController?.signal?.aborted ?? false).toBe(false)
     expect(yieldedCount).toBe(15)
+  })
+
+  it("stream: alternate second-message_start invalidates the source before terminal", async () => {
+    const sessionHeader = "es-alt-boundary"
+    mockMessages = [assistantMessage([{ type: "text", text: "seed" }])]
+    const seed = await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: false,
+      tools: [READ_TOOL],
+      messages: [{ role: "user", content: "seed" }],
+    }, sessionHeader)
+    await seed.text()
+    const sourceSessionId = lookupSharedSession(`${sessionHeader}-${TEST_RUN_ID}`)?.claudeSessionId
+    expect(sourceSessionId).toBeDefined()
+
+    mockMessages = [
+      messageStart("msg_alt_1"),
+      toolUseBlockStart(0, "read", "tu-alt"),
+      inputJsonDelta(0, '{"file_path":"alt"}'),
+      blockStop(0),
+      // Some SDK versions surface assistant + deny before the first tool-use
+      // message_delta. The second message_start is then the drain boundary.
+      assistantMessage([{ type: "tool_use", id: "tu-alt", name: "read", input: { file_path: "alt" } }]),
+      userDenyMessage("tu-alt"),
+      messageStart("msg_alt_2"),
+      textBlockStart(0),
+      textDelta(0, "HIDDEN_ALT_DIGEST"),
+      blockStop(0),
+      messageDelta("end_turn"),
+      messageStop(),
+      assistantMessage([{ type: "text", text: "HIDDEN_ALT_DIGEST" }]),
+    ]
+
+    const response = await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 400,
+      stream: true,
+      tools: [READ_TOOL],
+      messages: [
+        { role: "user", content: "seed" },
+        { role: "assistant", content: "seed" },
+        { role: "user", content: "read alt" },
+      ],
+    }, sessionHeader)
+    const text = await response.text()
+    expect(capturedQueryParams.options.resume).toBe(sourceSessionId)
+    expect(text).toContain('"id":"tu-alt"')
+    expect(text).toContain('"stop_reason":"tool_use"')
+    expect(text).toContain("message_stop")
+    expect(text).not.toContain("HIDDEN_ALT_DIGEST")
+
+    // No durable checkpoint UUID was observed in this alternate ordering.
+    // The old source must therefore be absent before message_stop is received,
+    // forcing the client's next tool-result request to replay in full.
+    expect(lookupSharedSession(`${sessionHeader}-${TEST_RUN_ID}`)).toBeUndefined()
   })
 })

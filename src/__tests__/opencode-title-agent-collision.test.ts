@@ -25,10 +25,27 @@
  */
 
 import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
-import { assistantMessage } from "./helpers"
+import { mkdtempSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { setSessionStoreDir } from "../proxy/sessionStore"
+
+let isolatedSessionDir = ""
+beforeEach(() => {
+  isolatedSessionDir = mkdtempSync(join(tmpdir(), "meridian-http-test-"))
+  setSessionStoreDir(isolatedSessionDir)
+})
+afterEach(async () => {
+  await Bun.sleep(25)
+  rmSync(isolatedSessionDir, { recursive: true, force: true })
+})
+import { assistantMessage, resolveMockSdkSessionId } from "./helpers"
 
 let mockMessages: unknown[] = []
 let capturedOptions: any[] = []
+let capturePromptItems = false
+let capturedPromptValue: unknown
+let capturedPromptItems: unknown[] = []
 
 /** Set to hold the title request inside query() so it keeps the turn lease
  *  while the user's turn arrives — the live race, made deterministic. */
@@ -41,14 +58,26 @@ let onTitleEnteredQuery: (() => void) | undefined
 
 mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   query: (params: any) => {
-    capturedOptions.push(params.options || {})
+    const options = params.options || {}
+    capturedOptions.push(options)
+    const sessionId = resolveMockSdkSessionId(options)
+    if (!sessionId) throw new Error("Expected Meridian to select or resume an SDK session")
     const isTitle = typeof params.prompt === "string" && params.prompt.includes("Generate a title")
     return (async function* () {
       if (isTitle) {
         onTitleEnteredQuery?.()
         if (holdTitleUntil) await holdTitleUntil
       }
-      for (const msg of mockMessages) yield msg
+      if (capturePromptItems) capturedPromptValue = params.prompt
+      if (
+        capturePromptItems
+        && params.prompt
+        && typeof params.prompt !== "string"
+        && typeof params.prompt[Symbol.asyncIterator] === "function"
+      ) {
+        for await (const item of params.prompt) capturedPromptItems.push(item)
+      }
+      for (const msg of mockMessages) yield { ...(msg as object), session_id: sessionId }
     })()
   },
   createSdkMcpServer: () => ({ type: "sdk", name: "test", instance: { tool: () => {}, registerTool: () => ({}) } }),
@@ -65,6 +94,8 @@ mock.module("../mcpTools", () => ({
 }))
 
 const { createProxyServer, clearSessionCache } = await import("../proxy/server")
+const { computeMessageBlockHashes, computeMessageHashes } = await import("../proxy/session/lineage")
+const { canonicalizeOpenCodeMessagesForLineage } = await import("../proxy/adapters/opencode")
 const { telemetryStore } = await import("../telemetry")
 
 function createTestApp() {
@@ -120,10 +151,71 @@ const USER_TURN_2 = {
   ],
 }
 
+const USER_PROMPT_HOOK = {
+  type: "text",
+  text: `<user-prompt-submit-hook>
+${JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: "UserPromptSubmit",
+      additionalContext: "Use a todo list for multi-step work.",
+    },
+  })}
+</user-prompt-submit-hook>`,
+}
+const HOOK_TURN_1 = {
+  ...USER_TURN_1,
+  messages: [{
+    role: "user",
+    content: [
+      USER_PROMPT_HOOK,
+      { type: "text", text: "first durable prompt", cache_control: { type: "ephemeral" } },
+    ],
+  }],
+}
+const HOOK_TURN_2 = {
+  ...USER_TURN_1,
+  messages: [
+    { role: "user", content: [{ type: "text", text: "first durable prompt" }] },
+    { role: "assistant", content: [{ type: "text", text: "ok" }] },
+    {
+      role: "user",
+      content: [
+        USER_PROMPT_HOOK,
+        { type: "text", text: "second durable prompt", cache_control: { type: "ephemeral" } },
+      ],
+    },
+  ],
+}
+
+describe("OpenCode request-scoped lineage metadata", () => {
+  it("hashes the active and historical forms of a UserPromptSubmit turn identically", () => {
+    const active = canonicalizeOpenCodeMessagesForLineage(HOOK_TURN_1.messages)
+    const historical = canonicalizeOpenCodeMessagesForLineage(HOOK_TURN_2.messages.slice(0, 1))
+
+    expect(computeMessageHashes(active)).toEqual(computeMessageHashes(historical))
+    expect(computeMessageBlockHashes(active)).toEqual(computeMessageBlockHashes(historical))
+    expect(HOOK_TURN_1.messages[0]?.content).toHaveLength(2)
+  })
+
+  it("retains malformed, hook-only, and assistant-authored lookalikes", () => {
+    const malformed = { type: "text", text: "<user-prompt-submit-hook>not json</user-prompt-submit-hook>" }
+    const messages = [
+      { role: "user", content: [malformed, { type: "text", text: "durable" }] },
+      { role: "user", content: [USER_PROMPT_HOOK] },
+      { role: "assistant", content: [USER_PROMPT_HOOK, { type: "text", text: "durable" }] },
+    ]
+
+    expect(canonicalizeOpenCodeMessagesForLineage(messages)).toEqual(messages)
+  })
+})
+
 describe("OpenCode title agent vs the user's conversation", () => {
   beforeEach(() => {
     mockMessages = [assistantMessage([{ type: "text", text: "ok" }])]
     capturedOptions = []
+    capturePromptItems = false
+    capturedPromptValue = undefined
+    capturedPromptItems = []
     holdTitleUntil = undefined
     onTitleEnteredQuery = undefined
     telemetryStore.clear()
@@ -147,12 +239,61 @@ describe("OpenCode title agent vs the user's conversation", () => {
   it("lets the user's conversation resume after a title turn interleaves", async () => {
     const app = createTestApp()
     await post(app, USER_TURN_1, USER_HEADERS)
+    const userSessionId = capturedOptions.at(-1)?.sessionId
+    expect(userSessionId).toMatch(/^[0-9a-f-]{36}$/)
     await post(app, TITLE_BODY, TITLE_HEADERS)
     const turn2 = await post(app, USER_TURN_2, USER_HEADERS)
     expect(turn2.status).toBe(200)
     // The title turn must not have displaced the conversation's stored lineage:
-    // turn 2 still resumes the SDK session rather than replaying cold.
-    expect(capturedOptions.at(-1)?.resume).toBe("test-session")
+    // turn 2 still resumes the exact session Meridian selected for turn 1.
+    expect(capturedOptions.at(-1)?.resume).toBe(userSessionId)
+  })
+
+  it("resumes when OpenCode drops UserPromptSubmit context from a historical turn", async () => {
+    const app = createTestApp()
+    expect((await post(app, HOOK_TURN_1, USER_HEADERS)).status).toBe(200)
+    const firstSessionId = capturedOptions.at(-1)?.sessionId
+    expect(firstSessionId).toMatch(/^[0-9a-f-]{36}$/)
+
+    expect((await post(app, HOOK_TURN_2, USER_HEADERS)).status).toBe(200)
+    expect(capturedOptions.at(-1)?.resume).toBe(firstSessionId)
+    expect(capturedOptions.at(-1)?.forkSession).toBe(true)
+  })
+
+  it("keeps canonical block indexes aligned for append-only tool results", async () => {
+    const app = createTestApp()
+    const first = {
+      ...USER_TURN_1,
+      messages: [{
+        role: "user",
+        content: [
+          USER_PROMPT_HOOK,
+          { type: "tool_result", tool_use_id: "call-a", content: "alpha" },
+        ],
+      }],
+    }
+    const second = {
+      ...USER_TURN_1,
+      messages: [{
+        role: "user",
+        content: [
+          USER_PROMPT_HOOK,
+          { type: "tool_result", tool_use_id: "call-a", content: "alpha" },
+          { type: "tool_result", tool_use_id: "call-b", content: "bravo" },
+        ],
+      }],
+    }
+
+    expect((await post(app, first, USER_HEADERS)).status).toBe(200)
+    const firstSessionId = capturedOptions.at(-1)?.sessionId
+    capturePromptItems = true
+    expect((await post(app, second, USER_HEADERS)).status).toBe(200)
+
+    expect(capturedOptions.at(-1)?.resume).toBe(firstSessionId)
+    const resumedPrompt = JSON.stringify([capturedPromptValue, capturedPromptItems])
+    expect(resumedPrompt).toContain("bravo")
+    expect(resumedPrompt).not.toContain("alpha")
+    expect(resumedPrompt).not.toContain("user-prompt-submit-hook")
   })
 
   it("keeps the title turn itself working and independent", async () => {
@@ -190,24 +331,17 @@ describe("OpenCode title agent vs the user's conversation", () => {
     for (let i = 0; i < 50 && capturedOptions.length < 2; i++) {
       await new Promise((r) => setTimeout(r, 2))
     }
+    // The title query is still gated. Entering the user's query before release
+    // proves the scoped requests did not contend on the same turn lease. This
+    // is stronger and less clock-sensitive than requiring a 0 ms metric.
+    const userEnteredBeforeRelease = capturedOptions.length === 2
     release()
 
     const [title, user] = await Promise.all([titlePromise, userPromise])
+    expect(userEnteredBeforeRelease).toBe(true)
     expect(title.status).toBe(200)
     expect(user.status).toBe(200)
     const userBody = await user.json() as any
     expect(JSON.stringify(userBody)).not.toContain("session advanced")
-
-    // The title turn held its own lease for the whole duration of the user's
-    // turn, and the user's turn did not wait on it for a millisecond. That
-    // zero IS the fix: live, this wait was 9,836 ms and ended in a 400.
-    //
-    // Asserted as 0 rather than "> 0 to prove the harness raced": the harness
-    // is proven live by running this file against the unscoped key, where the
-    // wait is non-zero and the status is 400. Demanding contention here would
-    // be demanding the bug.
-    const userMetric = telemetryStore.getRecent({ limit: 10 }).find((m) => m.toolCount === 1)
-    expect(userMetric).toBeDefined()
-    expect(userMetric!.sessionQueueWaitMs ?? 0).toBe(0)
   })
 })

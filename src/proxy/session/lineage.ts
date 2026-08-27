@@ -63,6 +63,9 @@ export interface SessionState {
   passthroughToolCallIds?: string[]
   /** Last observed token usage for this session (from SDK message_start / message_delta events) */
   contextUsage?: TokenUsage
+  /** Exact SDK transcript roots for cross-process lifecycle retention. */
+  currentTranscript?: { sessionId: string; configDir: string; projectDir?: string }
+  previousTranscript?: { sessionId: string; configDir: string; projectDir?: string }
 }
 
 /**
@@ -81,6 +84,27 @@ export function withClientAssistantUuid(
   // A later UUID-less assistant fragment must not leave an older fragment as
   // the rollback point for a client message that contains both.
   next[clientMessageCount] = typeof uuid === "string" && uuid.length > 0 ? uuid : null
+  return next
+}
+
+/**
+ * Reconcile rollback UUIDs with the session the SDK actually returned.
+ *
+ * A fork remaps every copied transcript UUID, so UUIDs inherited from the
+ * resumed session are invalid in the returned session. The one UUID observed
+ * for this request's new client-visible assistant remains valid and occupies
+ * its future client message slot.
+ */
+export function reconcileReturnedSessionUuids(
+  existing: Array<string | null>,
+  clientMessageCount: number,
+  currentAssistantUuid: string | null,
+  resumeSessionId: string | undefined,
+  returnedSessionId: string | undefined,
+): Array<string | null> {
+  if (!resumeSessionId || !returnedSessionId || returnedSessionId === resumeSessionId) return existing
+  const next = new Array<string | null>(clientMessageCount + 1).fill(null)
+  next[clientMessageCount] = currentAssistantUuid
   return next
 }
 

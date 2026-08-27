@@ -28,17 +28,18 @@ import {
   textDelta,
   blockStop,
   parseSSE,
+  withMockSdkSessionId,
 } from "./helpers"
 
 let mockMessages: any[] = []
 let mockErrorAfter: number | null = null
 
 mock.module("@anthropic-ai/claude-agent-sdk", () => ({
-  query: () => {
+  query: (params: any) => {
     return (async function* () {
       let yielded = 0
       for (const msg of mockMessages) {
-        yield msg
+        yield withMockSdkSessionId(msg, params.options)
         yielded++
         if (mockErrorAfter !== null && yielded >= mockErrorAfter) {
           throw new Error("429 Too Many Requests - rate limit exceeded")
@@ -141,6 +142,30 @@ describe("Stream error recovery after message_start", () => {
     // successful message and never retries. Partial output followed by a crash
     // is a truncation, and nothing here can know the answer was complete.
     expect((recoveryDelta?.data as any).delta.stop_reason).toBe("max_tokens")
+  })
+
+  it("closes a dangling content block before the terminal error envelope", async () => {
+    mockMessages = [
+      messageStart("msg_dangling"),
+      textBlockStart(4),
+      textDelta(4, "partial"),
+    ]
+    mockErrorAfter = 3
+
+    const app = createTestApp()
+    const events = await postStream(app)
+    const eventTypes = events.map((event) => event.event)
+    const blockStopIndex = eventTypes.indexOf("content_block_stop")
+    const messageDeltaIndex = eventTypes.indexOf("message_delta")
+    const errorIndex = eventTypes.indexOf("error")
+    const messageStopIndex = eventTypes.indexOf("message_stop")
+
+    expect(blockStopIndex).toBeGreaterThan(-1)
+    expect(messageDeltaIndex).toBeGreaterThan(blockStopIndex)
+    expect(errorIndex).toBeGreaterThan(messageDeltaIndex)
+    expect(messageStopIndex).toBeGreaterThan(errorIndex)
+    expect(events.slice(messageDeltaIndex + 1).some((event) =>
+      event.event.startsWith("content_block_"))).toBe(false)
   })
 
   it("should emit error immediately when message_start was NOT sent", async () => {
