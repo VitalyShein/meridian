@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.63.0](https://github.com/rynfar/meridian/compare/meridian-v1.62.7...meridian-v1.63.0) (2026-08-27)
+
+
+### Features
+
+* report build provenance and available updates on /health ([#866](https://github.com/rynfar/meridian/issues/866)) ([992f81c](https://github.com/rynfar/meridian/commit/992f81cfed4b17894f09068718705fbd5a937000))
+
+
+### Bug Fixes
+
+* **passthrough:** make durable resume crash safe ([#879](https://github.com/rynfar/meridian/issues/879)) ([2ccc48a](https://github.com/rynfar/meridian/commit/2ccc48a5d75514b490420b2c6a735a5983107f7e)), closes [#877](https://github.com/rynfar/meridian/issues/877) [#827](https://github.com/rynfar/meridian/issues/827) [#828](https://github.com/rynfar/meridian/issues/828)
+
 ## [1.62.7](https://github.com/rynfar/meridian/compare/meridian-v1.62.6...meridian-v1.62.7) (2026-08-20)
 
 
