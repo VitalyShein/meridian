@@ -84,7 +84,17 @@ import { getAdapterTransforms } from "./transforms/registry"
 import { loadPlugins, getActiveTransforms } from "./plugins/loader"
 import type { LoadedPlugin } from "./plugins/types"
 import { resolveProfile, listProfiles, setActiveProfile, getActiveProfileId, getEffectiveProfiles, restoreActiveProfile, type ResolvedProfile } from "./profiles"
-import { getRoutingMode, resolvePriorityOrder, choosePriorityProfile, ProfileExhaustion, AssignmentStore, resolveCooldownUntil } from "./routing"
+import {
+  getRoutingMode,
+  getPriorityFailbackPolicy,
+  shouldPromotePriorityAssignment,
+  resolvePriorityOrder,
+  choosePriorityProfile,
+  ProfileExhaustion,
+  AssignmentStore,
+  resolveCooldownUntil,
+  type PriorityAssignment,
+} from "./routing"
 import { getSetting, setSetting } from "./settings"
 import { filterBetasForProfile, getBetaPolicyFromEnv } from "./betas"
 import { createFileChangeHook, extractFileChangesFromMessages, formatFileChangeSummary, type FileChange } from "./fileChanges"
@@ -105,7 +115,17 @@ import {
 import { getConversationFingerprint, getPriorityAssignmentKey } from "./session/fingerprint"
 // Re-export for backwards compatibility (existing tests import from here)
 
-import { lookupSession, storeSession, clearSessionCache, getMaxSessionsLimit, evictSession as evictCachedSession, getSessionByClaudeId } from "./session/cache"
+import {
+  lookupSession,
+  storeSession,
+  rollbackPrioritySessionPublication,
+  finalizePrioritySessionPublication,
+  clearSessionCache,
+  getMaxSessionsLimit,
+  evictSession as evictCachedSession,
+  getSessionByClaudeId,
+  type PrioritySessionPublication,
+} from "./session/cache"
 import { processSessionTurns, type SessionTurnLease } from "./session/turnCoordinator"
 import {
   CrossProcessTurnAcquireTimeoutError,
@@ -118,6 +138,10 @@ import {
   lookupSessionRecovery,
   lookupSharedSession,
   lookupSharedSessionResult,
+  lookupPriorityAssignmentResult,
+  claimPriorityAttempt,
+  releasePriorityAttempt,
+  blockPriorityAttempt,
   listStoredSessions,
   readSessionStoreSnapshot,
   readSessionStoreGenerationSnapshot,
@@ -219,14 +243,28 @@ interface RequestMeta {
   sessionTurnLease?: SessionTurnLease
   /** Durable revisions observed before cross-process turn acquisition. */
   sharedSessionRevisionsAtArrival?: Record<string, string | null>
+  /** Verified before queueing so attestation freshness cannot expire while waiting. */
+  routingTurnIdentity?: {
+    readonly kind: "human"
+    readonly turnId: string
+    readonly issuedAt: number
+  }
   /** Permanently retain the session lease when mandatory durable cleanup fails. */
   retainSessionTurnFence?: () => void
+}
+
+interface PriorityAttemptExposure {
+  committed: boolean
+  reason?: string
 }
 
 interface HandleMessagesOptions {
   body: any
   forcedProfileId?: string
   turnWatchdogSignal?: AbortSignal
+  forceFreshPriorityReplay?: boolean
+  priorityPublication?: PrioritySessionPublication
+  priorityAttemptExposure?: PriorityAttemptExposure
 }
 
 function totalQueueWaitMs(meta: RequestMeta): number {
@@ -527,6 +565,32 @@ function checkTokenHealth(
         requestId,
       })
     }
+  }
+}
+
+type PriorityDispatchOptions = {
+  readonly context: Context
+  readonly body: any
+  readonly requestMeta: RequestMeta
+  readonly candidateIds: readonly string[]
+  readonly sessionKey: string | null
+  readonly wantsStream: boolean
+  readonly currentProfileId: string | undefined
+  readonly turnWatchdogSignal?: AbortSignal
+  readonly publicationTurn?: {
+    readonly turnId: string
+    readonly issuedAt: number
+  }
+  /** Independently verified current request turn, never stored retention metadata. */
+  readonly claimTurn?: {
+    readonly turnId: string
+    readonly issuedAt: number
+  }
+  readonly durableRoute?: {
+    readonly routeKey: string
+    readonly expectedGeneration: string
+    /** The stored route no longer proves the current mapping generation. */
+    readonly forceFreshReplay?: boolean
   }
 }
 
@@ -1023,7 +1087,19 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     }
     if (failure) {
       await reader.cancel().catch(() => {})
-      return { failed: true, errorPayload: failure.payload, errorType: failure.type, response: res }
+      // The original response body is now locked and consumed. Preserve the
+      // exact bytes already read so a no-retry exposure barrier can still
+      // return a usable account-error response to the client.
+      const replay = new ReadableStream<Uint8Array>({
+        start(ctrl) {
+          for (const chunk of consumed) ctrl.enqueue(chunk)
+          ctrl.close()
+        },
+      })
+      const response = new Response(replay, { status: res.status, headers: res.headers })
+      const completion = responseCompletions.get(res)
+      if (completion) responseCompletions.set(response, completion)
+      return { failed: true, errorPayload: failure.payload, errorType: failure.type, response }
     }
     const rest = new ReadableStream<Uint8Array>({
       start(ctrl) { for (const chunk of consumed) ctrl.enqueue(chunk) },
@@ -1040,30 +1116,93 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     return { failed: false, errorPayload: null, errorType: null, response }
   }
 
-  async function dispatchPriority(
-    c: Context,
-    body: any,
-    requestMeta: RequestMeta,
-    orderedCandidateIds: string[],
-    sessionKey: string | null,
-    wantsStream: boolean,
-    turnWatchdogSignal?: AbortSignal,
-  ): Promise<Response> {
+  async function dispatchPriority(options: PriorityDispatchOptions): Promise<Response> {
+    let attemptOwnerToken: string | undefined
+    if (options.durableRoute && options.publicationTurn) {
+      try {
+        const claim = claimPriorityAttempt({
+          routeKey: options.durableRoute.routeKey,
+          expectedAssignmentGeneration: options.durableRoute.expectedGeneration,
+          turn: options.claimTurn,
+        })
+        if (!claim) {
+          return options.context.json({
+            type: "error",
+            error: { type: "overloaded_error", message: "Durable priority attempt state is unavailable" },
+          }, 503)
+        }
+        attemptOwnerToken = claim.ownerToken
+      } catch (error) {
+        claudeLog("priority.attempt_claim_failed", {
+          routeKey: options.durableRoute.routeKey,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        return options.context.json({
+          type: "error",
+          error: { type: "overloaded_error", message: "Durable priority attempt state is unavailable" },
+        }, 503)
+      }
+    }
+    const settleAttempt = (disposition: "release" | "block"): boolean => {
+      if (!attemptOwnerToken || !options.durableRoute) return true
+      try {
+        return disposition === "block"
+          ? blockPriorityAttempt(options.durableRoute.routeKey, attemptOwnerToken)
+          : releasePriorityAttempt(options.durableRoute.routeKey, attemptOwnerToken)
+      } catch (error) {
+        claudeLog("priority.attempt_settle_failed", {
+          routeKey: options.durableRoute.routeKey,
+          disposition,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        return false
+      }
+    }
+    const unavailableAttemptResponse = (): Response => options.context.json({
+      type: "error",
+      error: { type: "overloaded_error", message: "Durable priority attempt state is unavailable" },
+    }, 503)
+
     let lastError: unknown = null
     let lastStatus = 429
     let previous: string | null = null
     let previousReason = "rate_limit_error"
-    for (const [attempt, candidate] of orderedCandidateIds.entries()) {
-      const inner = await handleMessages(c, forkAttemptMeta(requestMeta, attempt), {
-        body,
+    for (const [attempt, candidate] of options.candidateIds.entries()) {
+      const exposure: PriorityAttemptExposure = { committed: false }
+      const priorityPublication = options.durableRoute && options.publicationTurn
+        ? {
+            routeKey: options.durableRoute.routeKey,
+            profileId: candidate,
+            lastHumanTurnDigest: options.publicationTurn.turnId,
+            lastHumanTurnIssuedAt: options.publicationTurn.issuedAt,
+            attemptOwnerToken: attemptOwnerToken!,
+            expectedAssignmentGeneration: options.durableRoute.expectedGeneration,
+          }
+        : undefined
+      const inner = await handleMessages(options.context, forkAttemptMeta(options.requestMeta, attempt), {
+        body: options.body,
         forcedProfileId: candidate,
-        turnWatchdogSignal,
+        turnWatchdogSignal: options.turnWatchdogSignal,
+        forceFreshPriorityReplay: priorityPublication !== undefined
+          && (options.durableRoute?.forceFreshReplay === true
+            || (options.currentProfileId !== undefined && candidate !== options.currentProfileId)),
+        priorityPublication,
+        priorityAttemptExposure: exposure,
       })
       const sniffed = await sniffAccountFailure(inner)
       if (!sniffed.failed) {
-        if (sessionKey) priorityAssignments.set(sessionKey, candidate)
+        if (options.sessionKey && !options.durableRoute) {
+          // Process memory preserves only legacy/keyless new-conversation
+          // affinity. Trusted attempts publish authority at the atomic durable
+          // terminal barrier and must not poison adoption on errors or cancel.
+          const previousAssignment = priorityAssignments.get(options.sessionKey)
+          priorityAssignments.set(options.sessionKey, {
+            profileId: candidate,
+            requestId: options.publicationTurn?.turnId ?? previousAssignment?.requestId,
+          })
+        }
         if (previous) {
-          claudeLog("profile.failover", { from: previous, to: candidate, reason: previousReason, sessionKey })
+          claudeLog("profile.failover", { from: previous, to: candidate, reason: previousReason, sessionKey: options.sessionKey })
           plog(`[PROXY] PRIORITY failover ${previous} -> ${candidate} (${previousReason})`)
         }
         return sniffed.response
@@ -1071,12 +1210,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       await responseCompletions.get(inner)?.catch(() => {})
       const reason = sniffed.errorType
       // Only a quota refusal has a reset to look up. Both cooldown tiers read
-      // the account's five-hour window, which says nothing about entitlement:
-      // a refused subscription would be suppressed until an unrelated quota
-      // boundary, and `refinePriorityCooldown` could only push that further
-      // out (`mark` lets a later refinement extend a cooldown, never shorten
-      // it). The conservative default stands instead, so the account is
-      // re-probed once the subscription may plausibly have been fixed.
+      // the account's five-hour window, which says nothing about entitlement.
       const quotaRefusal = isQuotaRefusal(reason)
       const cooldownUntil = quotaRefusal
         ? priorityCooldownUntil(candidate, Date.now())
@@ -1088,13 +1222,22 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       lastStatus = inner.status
       previous = candidate
       previousReason = reason
+      if (exposure.committed) {
+        // The SDK may already have emitted content, structured output, or a
+        // tool side effect even though a non-stream handler ultimately returned
+        // an account-shaped error. Never replay that attempt on another account.
+        claudeLog("priority.failover_withheld", { profile: candidate, reason: exposure.reason ?? "attempt_exposed" })
+        if (!settleAttempt("block")) return unavailableAttemptResponse()
+        return sniffed.response
+      }
     }
-    // Every candidate failed: surface the LAST tried profile's error (owner
-    // decision). Stream sniff consumed the inner body, so reconstruct the
-    // exact frame for SSE requests; non-stream errors pass through as JSON,
-    // carrying the status that came with them — a pool refused for billing
-    // must not reach the client as a 429 it would dutifully back off from.
-    if (wantsStream) {
+    // Every candidate ended before exposure. Release the exact durable claim
+    // before the client can retry; failure stays fail-closed and never advances
+    // to another account or returns a retryable account-shaped response.
+    if (!settleAttempt("release")) return unavailableAttemptResponse()
+    // Surface the LAST tried profile's error (owner decision). Stream sniff
+    // consumed the inner body, so reconstruct the exact frame for SSE requests.
+    if (options.wantsStream) {
       return new Response(`event: error\ndata: ${JSON.stringify(lastError)}\n\n`, {
         status: 200,
         headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" },
@@ -1102,6 +1245,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     }
     return new Response(JSON.stringify(lastError), { status: lastStatus, headers: { "content-type": "application/json" } })
   }
+
   app.use("/auth/*", requireAuth)
 
   app.get("/", (c) => {
@@ -1143,32 +1287,101 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       // transcript. A failed durable invalidation after that point must retain
       // the logical-turn fence; failures before any resume are safe to release.
       let resumedMappingMayBeAdvanced = false
+      let priorityTerminalCommitted = false
+      let recoveryPublishedTarget: TranscriptLocator | undefined
+      let priorityRollbackRetirement: Promise<void> | undefined
       const evictSession = (...args: Parameters<typeof evictCachedSession>): boolean => {
         try {
+          if (priorityTerminalCommitted && options.priorityPublication) return true
+          if (options.priorityPublication?.rollback) {
+            const rollbackScopeKey = options.priorityPublication.rollback.key
+            const restoredGeneration = rollbackPrioritySessionPublication(
+              args[0],
+              args[2] ?? options.body.messages ?? [],
+              args[1],
+              options.priorityPublication,
+            )
+            if (!restoredGeneration) {
+              requestMeta.retainSessionTurnFence?.()
+              return false
+            }
+            requestMeta.sessionTurnLease?.markRolledBack(rollbackScopeKey)
+            resumedMappingMayBeAdvanced = false
+            const retirements: Promise<void>[] = []
+            if (managedForkTarget && managedForkPublished) {
+              // The exact rollback removed this target from durable authority.
+              // Retire its live lifecycle record and keep its GC pin until the
+              // durable retired transition completes.
+              managedForkPublished = false
+              retirements.push(abandonManagedFork("priority_publication_rollback"))
+            }
+            if (recoveryPublishedTarget) {
+              const recoveryTarget = recoveryPublishedTarget
+              recoveryPublishedTarget = undefined
+              retirements.push(abandonFork(recoveryTarget, sessionGcOptions).catch((error) => {
+                claudeLog("session.fork_abandon_failed", {
+                  reason: "priority_recovery_publication_rollback",
+                  error: error instanceof Error ? error.message : String(error),
+                })
+              }))
+            }
+            if (retirements.length > 0) {
+              const pending = Promise.all(retirements).then(() => undefined)
+              priorityRollbackRetirement = priorityRollbackRetirement
+                ? Promise.all([priorityRollbackRetirement, pending]).then(() => undefined)
+                : pending
+            }
+            return true
+          }
+          if (options.priorityPublication) {
+            // Every durable resume writes an isolated managed fork. Before its
+            // atomic publication, the old routed mapping remains exact and must
+            // not be deleted merely to authorize a noncanonical terminal.
+            return false
+          }
           const evicted = evictCachedSession(...args)
           if (!evicted && resumedMappingMayBeAdvanced) {
-            // A failed generation-fenced invalidation of a mapping this turn
-            // actually resumed is just as uncertain as an exception. Keep both
-            // turn fences held so no peer can resume a transcript this request
-            // may already have advanced physically. Fresh turns have no source
-            // generation to quarantine, so an absent mapping is harmless.
             requestMeta.retainSessionTurnFence?.()
           }
-          if (evicted) resumedMappingMayBeAdvanced = false
+          if (evicted) {
+            resumedMappingMayBeAdvanced = false
+            const retirements: Promise<void>[] = []
+            if (managedForkTarget && managedForkPublished) {
+              managedForkPublished = false
+              retirements.push(abandonManagedFork("mapping_evicted_after_publication"))
+            }
+            if (recoveryPublishedTarget) {
+              const recoveryTarget = recoveryPublishedTarget
+              recoveryPublishedTarget = undefined
+              retirements.push(abandonFork(recoveryTarget, sessionGcOptions).catch((error) => {
+                claudeLog("session.fork_abandon_failed", {
+                  reason: "recovery_mapping_evicted_after_publication",
+                  error: error instanceof Error ? error.message : String(error),
+                })
+              }))
+            }
+            if (retirements.length > 0) {
+              const pending = Promise.all(retirements).then(() => undefined)
+              priorityRollbackRetirement = priorityRollbackRetirement
+                ? Promise.all([priorityRollbackRetirement, pending]).then(() => undefined)
+                : pending
+            }
+          }
           return evicted
         } catch (error) {
-          // If durable cleanup is uncertain, keep both process-local and
-          // cross-process turn fences held. Releasing would let another proxy
-          // resume the mapping we failed to invalidate.
-          if (resumedMappingMayBeAdvanced) requestMeta.retainSessionTurnFence?.()
+          if (resumedMappingMayBeAdvanced || options.priorityPublication?.rollback) {
+            requestMeta.retainSessionTurnFence?.()
+          }
           throw error
         }
       }
+
       let managedForkTarget: TranscriptLocator | undefined
       let managedForkSource: TranscriptLocator | undefined
       let managedForkCommitted = false
       let managedForkPublished = false
       let managedForkAbandoned = false
+      let managedForkAbandonment: Promise<void> | undefined
       let managedForkSuperseded = false
       // A fresh transcript uses the caller-selected SDK sessionId as its
       // identity. Returned event IDs are advisory for this supported SDK path;
@@ -1182,32 +1395,38 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         releaseManagedForkPins = undefined
       }
 
-      const abandonManagedFork = async (reason: string): Promise<void> => {
-        if (unexpectedManagedForkTarget) {
-          const unexpected = unexpectedManagedForkTarget
-          unexpectedManagedForkTarget = undefined
-          await registerLiveTranscript(unexpected, sessionGcOptions)
-            .then((exact) => abandonFork(exact, sessionGcOptions))
-            .catch((error) => {
-              claudeLog("session.unexpected_fork_track_failed", {
-                reason,
-                sessionId: unexpected.sessionId,
-                error: error instanceof Error ? error.message : String(error),
+      const abandonManagedFork = (reason: string): Promise<void> => {
+        if (managedForkAbandonment) return managedForkAbandonment
+        const pending = (async (): Promise<void> => {
+          if (unexpectedManagedForkTarget) {
+            const unexpected = unexpectedManagedForkTarget
+            unexpectedManagedForkTarget = undefined
+            await registerLiveTranscript(unexpected, sessionGcOptions)
+              .then((exact) => abandonFork(exact, sessionGcOptions))
+              .catch((error) => {
+                claudeLog("session.unexpected_fork_track_failed", {
+                  reason,
+                  sessionId: unexpected.sessionId,
+                  error: error instanceof Error ? error.message : String(error),
+                })
               })
-            })
-        }
-        if (!managedForkTarget || managedForkPublished || managedForkAbandoned) {
-          if (managedForkPublished || !managedForkTarget) releaseManagedPins()
-          return
-        }
-        managedForkAbandoned = true
-        await abandonFork(managedForkTarget, sessionGcOptions).catch((error) => {
-          const message = error instanceof Error ? error.message : String(error)
-          claudeLog("session.fork_abandon_failed", { reason, error: message })
-        })
-        releaseManagedPins()
-        void sweepSessionGc()
+          }
+          if (!managedForkTarget || managedForkPublished || managedForkAbandoned) {
+            if (managedForkPublished || !managedForkTarget) releaseManagedPins()
+            return
+          }
+          managedForkAbandoned = true
+          await abandonFork(managedForkTarget, sessionGcOptions).catch((error) => {
+            const message = error instanceof Error ? error.message : String(error)
+            claudeLog("session.fork_abandon_failed", { reason, error: message })
+          })
+          releaseManagedPins()
+          void sweepSessionGc()
+        })()
+        managedForkAbandonment = pending
+        return pending
       }
+
 
       const commitManagedFork = async (): Promise<void> => {
         if (!managedForkTarget || managedForkSuperseded || managedForkCommitted) return
@@ -1218,8 +1437,53 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         managedForkCommitted = true
       }
 
+      const assertPriorityPublicationReady = (): void => {
+        if (options.priorityPublication && !options.priorityPublication.rollback) {
+          throw new Error("Durable priority attempt reached terminal without atomic publication")
+        }
+      }
+
+      const finalizePriorityPublication = (): void => {
+        assertPriorityPublicationReady()
+        const publication = options.priorityPublication
+        if (!publication) return
+        if (requestAbort.controller.signal.aborted || durableWritesRevoked) {
+          throw new Error("Durable priority attempt was revoked before terminal finalization")
+        }
+        if (!finalizePrioritySessionPublication(publication)) {
+          // Publication is not terminal authority until its exact attempt claim
+          // and rollback marker are removed together. Withhold terminal bytes.
+          throw new Error("Durable priority attempt changed before terminal finalization")
+        }
+        // From this synchronous terminal boundary onward, body cancellation may
+        // discard queued bytes but must never revoke already-authoritative state.
+        priorityTerminalCommitted = true
+      }
+
       try {
         const body = options.body
+        const markPriorityAttemptExposure = (reason: string): void => {
+          const exposure = options.priorityAttemptExposure
+          if (!exposure || exposure.committed) return
+          exposure.committed = true
+          exposure.reason = reason
+        }
+        const observePriorityAttemptMessage = (message: any): void => {
+          if (message?.type === "assistant" && Array.isArray(message.message?.content) && message.message.content.length > 0) {
+            markPriorityAttemptExposure("assistant_content")
+            return
+          }
+          if (message?.type === "stream_event") {
+            const type = message.event?.type
+            if (type === "message_start" || type === "content_block_start" || type === "content_block_delta") {
+              markPriorityAttemptExposure("stream_content")
+              return
+            }
+          }
+          if (message?.type === "result" && message.structured_output !== undefined) {
+            markPriorityAttemptExposure("structured_output")
+          }
+        }
 
         // Validate required fields
         if (!Array.isArray(body.messages)) {
@@ -1273,53 +1537,173 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         // so a session and its subagent/fork requests land on one account.
         const routingMode = getRoutingMode(process.env.MERIDIAN_ROUTING ?? getSetting("routing"))
         // Priority mode (opt-in): unpinned requests are dispatched across the
-        // ordered pool with per-request failover. Pinned requests (explicit
-        // x-meridian-profile — including our own internal hops) bypass the
-        // pool entirely and take the normal path below.
+        // ordered pool with per-request failover. Pinned requests bypass it.
         if (routingMode === "priority" && !options.forcedProfileId && !c.req.header("x-meridian-profile")) {
           const effectivePool = getEffectiveProfiles(finalConfig.profiles)
           if (effectivePool.length > 1) {
             const { order, unknown } = resolvePriorityOrder(effectivePool.map(p => p.id), priorityProfileOrderSetting())
             if (unknown.length > 0) claudeLog("priority.unknown_order_ids", { unknown })
-            // Keyless clients (pylon's main process, OpenCode setups that omit
-            // x-opencode-session) fall back to the conversation fingerprint —
-            // without it they re-pick an account every turn and bounce back to
-            // the preferred profile the moment its cooldown expires, replaying
-            // the whole history against a cold cache.
-            // Deliberately not clientWorkingDirectory (computed below): no
-            // MERIDIAN_WORKDIR/CLAUDE_PROXY_WORKDIR override here — that
-            // override would collapse every client's account key to one
-            // shared value.
             const assignmentCwd = adapter.extractClientWorkingDirectory?.(body)
               ?? adapter.extractWorkingDirectory(body)
+            const adapterSessionId = adapter.getSessionId(c, body)
             const sessionKey = getPriorityAssignmentKey(
-              adapter.getSessionId(c, body),
+              adapterSessionId,
               lineageMessages,
               assignmentCwd,
             )
-            const assigned = sessionKey ? priorityAssignments.get(sessionKey) : undefined
-            // Assignment affinity: an existing conversation stays on its
-            // account while that account is healthy (protects warm prompt
-            // caches). Only NEW sessions drain back after a reset.
-            let first: string
-            if (assigned && order.includes(assigned) && !priorityExhaustion.isExhausted(assigned)) {
-              first = assigned
-            } else {
+            const preferred = order[0]
+            if (preferred !== undefined) {
+              const trustedTurn = requestMeta.routingTurnIdentity
+              let promotionTurn = trustedTurn
+              let publicationTurn: PriorityDispatchOptions["publicationTurn"]
+              const failbackPolicy = getPriorityFailbackPolicy(
+                process.env.MERIDIAN_PRIORITY_FAILBACK ?? getSetting("priorityFailback"),
+              )
+              let durableRoute: PriorityDispatchOptions["durableRoute"]
+              let assignment: PriorityAssignment | undefined
+              let routeMappingIsCurrent = false
+              if (adapterSessionId) {
+                // Adapter namespacing prevents an unrelated client family from
+                // retaining or adopting an OpenCode route with a colliding ID.
+                const routeKey = `${adapter.name}:${adapterSessionId}`
+                const routeResult = lookupPriorityAssignmentResult(routeKey)
+                if (routeResult.status === "error") {
+                  return c.json({
+                    type: "error",
+                    error: { type: "overloaded_error", message: "Durable priority routing state is unavailable" },
+                  }, 503)
+                }
+                if (routeResult.status === "found") {
+                  durableRoute = { routeKey, expectedGeneration: routeResult.generation }
+                  assignment = {
+                    profileId: routeResult.assignment.profileId,
+                    requestId: routeResult.assignment.lastHumanTurnDigest,
+                  }
+                  // Existing signed metadata is retention-only authority. It
+                  // may refresh this exact route atomically, but promotionTurn
+                  // below remains the sole permission to move profiles.
+                  publicationTurn = {
+                    turnId: routeResult.assignment.lastHumanTurnDigest,
+                    issuedAt: routeResult.assignment.lastHumanTurnIssuedAt,
+                  }
+                  if (trustedTurn) {
+                    const sameHumanTurn = trustedTurn.turnId === routeResult.assignment.lastHumanTurnDigest
+                    const strictlyNewer = trustedTurn.issuedAt > routeResult.assignment.lastHumanTurnIssuedAt
+                    if (sameHumanTurn) {
+                      publicationTurn = {
+                        turnId: trustedTurn.turnId,
+                        issuedAt: Math.max(trustedTurn.issuedAt, routeResult.assignment.lastHumanTurnIssuedAt),
+                      }
+                    } else if (strictlyNewer) {
+                      publicationTurn = trustedTurn
+                    } else {
+                      // A valid but older/equal changed token is a replay or an
+                      // ambiguous same-second turn. Retain and republish the
+                      // current route, but never let it trigger failback.
+                      promotionTurn = undefined
+                      claudeLog("priority.attestation_replay_withheld", {
+                        routeKey,
+                        issuedAt: trustedTurn.issuedAt,
+                        highWater: routeResult.assignment.lastHumanTurnIssuedAt,
+                      })
+                    }
+                  }
+                  const mapped = lookupSharedSessionResult(routeResult.assignment.mappingKey)
+                  if (mapped.status === "error") {
+                    return c.json({
+                      type: "error",
+                      error: { type: "overloaded_error", message: "Durable priority session state is unavailable" },
+                    }, 503)
+                  }
+                  routeMappingIsCurrent = mapped.status === "found"
+                    && mapped.generation === routeResult.assignment.mappingGeneration
+                  if (!routeMappingIsCurrent) {
+                    // Never resume an unproved mapping generation. Only a fresh,
+                    // trusted human-turn proof may atomically repair authority;
+                    // unsigned/internal work retains the route and fails closed.
+                    if (!promotionTurn) {
+                      return c.json({
+                        type: "error",
+                        error: { type: "overloaded_error", message: "Durable priority session state is unavailable" },
+                      }, 503)
+                    }
+                    durableRoute = { ...durableRoute, forceFreshReplay: true }
+                  }
+                } else if (routeResult.attempt && !trustedTurn) {
+                  // An absent route can still carry a durable uncertain-attempt
+                  // blocker. Missing/invalid identity cannot bypass it.
+                  return c.json({
+                    type: "error",
+                    error: { type: "overloaded_error", message: "Durable priority attempt state is unavailable" },
+                  }, 503)
+                } else if (trustedTurn) {
+                  durableRoute = { routeKey, expectedGeneration: routeResult.generation }
+                  publicationTurn = trustedTurn
+                } else if (sessionKey) {
+                  // A process-local assignment preserves legacy/keyless affinity
+                  // but can never create durable promotion authority.
+                  assignment = priorityAssignments.get(sessionKey)
+                }
+              } else if (sessionKey) {
+                assignment = priorityAssignments.get(sessionKey)
+              }
+
+              const shouldPromote = assignment !== undefined
+                && durableRoute !== undefined
+                && routeMappingIsCurrent
+                && assignment.profileId !== preferred
+                && order.includes(assignment.profileId)
+                && !priorityExhaustion.isExhausted(assignment.profileId)
+                && !priorityExhaustion.isExhausted(preferred)
+                && shouldPromotePriorityAssignment({
+                  policy: failbackPolicy,
+                  assignment,
+                  requestId: promotionTurn?.turnId,
+                  requestKind: promotionTurn?.kind,
+                })
+              const assignedProfile = assignment?.profileId
+              const assignmentIsHealthy = assignedProfile !== undefined
+                && order.includes(assignedProfile)
+                && !priorityExhaustion.isExhausted(assignedProfile)
+              const retainOnlyProfile = durableRoute && !promotionTurn
+                ? assignedProfile
+                : undefined
+              if (retainOnlyProfile !== undefined && !order.includes(retainOnlyProfile)) {
+                return c.json({
+                  type: "error",
+                  error: { type: "overloaded_error", message: "Durable priority routing state is unavailable" },
+                }, 503)
+              }
               const pick = choosePriorityProfile(order, id => priorityExhaustion.isExhausted(id))
-              first = pick?.id ?? order[0]!
+              const first = retainOnlyProfile
+                ?? (shouldPromote
+                  ? preferred
+                  : assignmentIsHealthy
+                    ? assignedProfile
+                    : pick?.id ?? preferred)
+              // Unsigned, hidden, replayed, or malformed work may resume only
+              // the retained route. It cannot create a cross-profile transcript
+              // that the durable route has no authenticated authority to adopt.
+              const candidates = retainOnlyProfile
+                ? [retainOnlyProfile]
+                : [first, ...order.filter(id => id !== first && !priorityExhaustion.isExhausted(id))]
+              return dispatchPriority({
+                context: c,
+                body,
+                requestMeta,
+                candidateIds: candidates,
+                sessionKey,
+                wantsStream: body.stream === true,
+                currentProfileId: assignedProfile,
+                turnWatchdogSignal: options.turnWatchdogSignal,
+                publicationTurn,
+                claimTurn: trustedTurn,
+                durableRoute,
+              })
             }
-            const candidates = [first, ...order.filter(id => id !== first && !priorityExhaustion.isExhausted(id))]
-            return dispatchPriority(
-              c,
-              body,
-              requestMeta,
-              candidates,
-              sessionKey,
-              body.stream === true,
-              options.turnWatchdogSignal,
-            )
           }
         }
+
         const profile = resolveProfile(
           finalConfig.profiles,
           finalConfig.defaultProfile,
@@ -1834,6 +2218,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             },
           )
         }
+        if (options.forceFreshPriorityReplay) {
+          if (!options.priorityPublication || !agentSessionId || !durableMappingKey) {
+            throw new Error("Fresh priority replay requires trusted keyed durable publication")
+          }
+          // A cross-profile transition replays the complete request into a
+          // pre-journaled fresh target. The old mapping remains authoritative
+          // until the atomic route+mapping CAS wins at the terminal barrier.
+          lineageResult = { type: "diverged", reason: "priority-failback" }
+        }
+
         // Publish the decision to plugins. Core has always known WHICH message
         // stopped matching; the log line only ever reported how many matched
         // ("prefix overlap 50/51"), which is why #767 had to hand-patch a build
@@ -2113,6 +2507,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         managedForkCommitted = false
         managedForkPublished = false
         managedForkAbandoned = false
+        managedForkAbandonment = undefined
         managedForkSuperseded = false
         managedFreshTarget = false
         unexpectedManagedForkTarget = undefined
@@ -2424,6 +2819,20 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       // Track tools discovered via ToolSearch (deferred tools that get called)
       const discoveredTools = new Set<string>()
 
+      const priorityExposureHook = options.priorityAttemptExposure
+        ? {
+            matcher: "",
+            hooks: [async (input: unknown) => {
+              const toolName = input && typeof input === "object"
+                ? Reflect.get(input, "tool_name")
+                : undefined
+              if (toolName !== "ToolSearch") markPriorityAttemptExposure(
+                toolName === "StructuredOutput" ? "structured_output_tool" : "tool_use",
+              )
+              return {}
+            }],
+          }
+        : undefined
       const sdkHooks = passthrough
         ? {
             PreToolUse: [{
@@ -2444,7 +2853,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 // message arrives without structured_output (HTTP 500). Let
                 // the SDK handle it internally, and never capture it as a
                 // client tool_use.
-                if (input.tool_name === "StructuredOutput") return {}
+                if (input.tool_name === "StructuredOutput") {
+                  markPriorityAttemptExposure("structured_output_tool")
+                  return {}
+                }
+                markPriorityAttemptExposure("tool_use")
                 // Track deferred tools that were discovered via ToolSearch
                 const toolName = stripMcpPrefix(input.tool_name)
                 if (hasDeferredTools && coreSet && !coreSet.has(toolName.toLowerCase())) {
@@ -2589,6 +3002,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           }
         : {
             ...(pipelineCtx.sdkHooks ?? {}),
+            ...(priorityExposureHook
+              ? {
+                  PreToolUse: [
+                    priorityExposureHook,
+                    ...(pipelineCtx.sdkHooks?.PreToolUse ?? []),
+                  ],
+                }
+              : {}),
             ...(fileChangeHook ? { PostToolUse: [fileChangeHook] } : {}),
           }
 
@@ -2651,6 +3072,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             )
             if (evicted) mappingInvalidated = true
             return evicted
+          }
+          const settleInterruptedNonStreamMapping = (): boolean => {
+            if (
+              options.priorityPublication
+              && !options.priorityPublication.rollback
+              && managedForkTarget
+              && !managedForkPublished
+            ) return true
+            return invalidateNonStreamMapping()
           }
 
           try {
@@ -2747,8 +3177,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   // still held for it so retries don't inherit dead holds.
                   releaseHeldDenies("non_stream_attempt_error")
 
-                  // Never retry after response content was yielded — response is committed
-                  if (didYieldContent) throw error
+                  // Tool hooks and structured output are committed exposure
+                  // even when the iterator has not yielded assistant content.
+                  if (didYieldContent || options.priorityAttemptExposure?.committed) throw error
 
                   // Retry: the resume was refused, not answered. Both refusals
                   // that mean "not right now" — the session is busy, or it could
@@ -2944,6 +3375,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             })()
 
             for await (const message of response) {
+              observePriorityAttemptMessage(message)
               // Capture session ID from SDK messages
               const observedSessionId = (message as { session_id?: unknown }).session_id
               if (typeof observedSessionId === "string" && observedSessionId) {
@@ -3179,7 +3611,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               (requestAbort.controller.signal.aborted || durableWritesRevoked || failedResumedTurn)
               && !isIndependentSession
             ) {
-              if (!invalidateNonStreamMapping()) {
+              if (!settleInterruptedNonStreamMapping()) {
                 throw new Error("Shared session mapping changed before interrupted non-stream invalidation")
               }
               claudeLog("session.interrupted_mapping_evicted", {
@@ -3195,7 +3627,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             ) {
               // A failed durability drain must not leave either a newly cached
               // checkpoint or an older mapping behind for the advanced client.
-              if (!invalidateNonStreamMapping()) {
+              if (!settleInterruptedNonStreamMapping()) {
                 throw new Error("Shared session mapping changed before non-stream recovery invalidation")
               }
               claudeLog("passthrough.noncanonical_session_evicted", { mode: "non_stream", reason: "drain_error" })
@@ -3483,6 +3915,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     publicationTranscriptLocator(currentSessionId!),
                     managedForkTarget?.sessionId === currentSessionId ? managedForkSource : undefined,
                     mappingExpectedGeneration,
+                    options.priorityPublication,
                       )
                         if (stored) {
                           mappingExpectedGeneration = stored
@@ -3529,6 +3962,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 }
               }
 
+              finalizePriorityPublication()
               const responseSessionId = currentSessionId || resumeSessionId || `session_${Date.now()}`
 
               return new Response(JSON.stringify({
@@ -3777,8 +4211,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   } catch (error) {
                     const errMsg = error instanceof Error ? error.message : String(error)
 
-                    // Never retry after client-visible SSE events — response is committed
-                    if (didYieldClientEvent) throw error
+                    // Tool hooks and structured output are committed exposure
+                    // even before the first client-visible SSE event.
+                    if (didYieldClientEvent || options.priorityAttemptExposure?.committed) throw error
 
                     // Retry: the resume was refused, not answered — see the
                     // non-stream branch above for the full rationale. The busy
@@ -4003,6 +4438,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               )
               try {
                 for await (const message of guardedResponse) {
+                  observePriorityAttemptMessage(message)
                   if (streamClosed && !awaitingEarlyStopDrain) {
                     exitedBeforeCanonicalTerminal = true
                     break
@@ -4532,6 +4968,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     publicationTranscriptLocator(currentSessionId!),
                     managedForkTarget?.sessionId === currentSessionId ? managedForkSource : undefined,
                     mappingExpectedGeneration,
+                    options.priorityPublication,
                       )
                       if (stored) {
                         mappingExpectedGeneration = stored
@@ -4735,6 +5172,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     recoveryForkTarget,
                   ])) {
                     const recoveryMessage = event as any
+                    observePriorityAttemptMessage(recoveryMessage)
                     if (recoveryMessage.session_id) {
                       if (recoveryMessage.session_id !== recoveryForkTarget.sessionId) {
                         if (recoveryMessage.session_id !== recoveryForkSource?.sessionId) {
@@ -4850,10 +5288,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     recoveryForkTarget,
                     recoveryForkSource,
                     mappingExpectedGeneration,
+                    options.priorityPublication,
                       )
                       if (stored) {
                         mappingExpectedGeneration = stored
                         recoveryForkPublished = true
+                        recoveryPublishedTarget = recoveryForkTarget
                       }
                       return stored
                     },
@@ -4959,6 +5399,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     })
                     void sweepSessionGc()
                   }
+                  if (priorityRollbackRetirement) await priorityRollbackRetirement
                   releaseRecoveryForkPins?.()
                 }
               }
@@ -5050,6 +5491,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 // Emit the terminal pair (both were withheld through the turn
                 // so recovered content lands ahead of them, where clients can
                 // still see it).
+                assertPriorityPublicationReady()
+                finalizePriorityPublication()
                 if (messageStartEmitted) {
                   sendTerminalDelta(streamedToolUseIds.size > 0 ? "tool_use" : undefined)
                   safeEnqueue(encoder.encode(`event: message_stop\ndata: {"type":"message_stop"}\n\n`), "final_message_stop")
@@ -5405,6 +5848,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     publicationTranscriptLocator(currentSessionId!),
                     managedForkTarget?.sessionId === currentSessionId ? managedForkSource : undefined,
                     mappingExpectedGeneration,
+                    options.priorityPublication,
                       )
                       if (stored) {
                         mappingExpectedGeneration = stored
@@ -5449,6 +5893,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 // Publication or exact source invalidation is now durable. Only
                 // now may the terminal pair authorize the client to submit the
                 // recovered tool results.
+                assertPriorityPublicationReady()
+                finalizePriorityPublication()
                 safeEnqueue(encoder.encode(
                   `event: message_delta\ndata: ${JSON.stringify({
                     type: "message_delta",
@@ -5635,6 +6081,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               }
             } finally {
               await abandonManagedFork("stream_complete_without_commit")
+              if (priorityRollbackRetirement) await priorityRollbackRetirement
               requestAbort.detach()
             }
             })().finally(() => {
@@ -5800,6 +6247,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
 
     let body: any
     let sharedSessionRevisionsAtArrival: Record<string, string | null> | undefined
+    let routingTurnIdentity: RequestMeta["routingTurnIdentity"]
     try {
       try {
         body = await c.req.json()
@@ -5824,6 +6272,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       // client-session identity.
       if (Array.isArray(body?.messages)) {
         const adapter = detectAdapter(c)
+        routingTurnIdentity = adapter.getRoutingTurnIdentity?.(c, body)
         const agentSessionId = adapter.getSessionId(c, body)
         if (agentSessionId) {
           const arrivalProfileIds = new Set(
@@ -5921,6 +6370,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         sdkActiveDurationMs: 0,
         sessionTurnLease,
         sharedSessionRevisionsAtArrival,
+        routingTurnIdentity,
         retainSessionTurnFence: () => { retainSessionTurnFence = true },
       }
       const response = await handleMessages(c, requestMeta, {
