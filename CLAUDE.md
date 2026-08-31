@@ -69,6 +69,8 @@ OpenCode-specific behavior is documented in `ARCHITECTURE.md` under "Agent-Speci
 ```
 server.ts          → HTTP routes, SSE streaming, concurrency (orchestration only)
 concurrency.ts     → Abortable SDK query semaphore, max-concurrency config
+requestAbort.ts    → HTTP request abort → SDK query abort bridge
+sessionTree.ts     → Live parent→child request registry, subtree cancellation (PURE bookkeeping)
 shutdown.ts        → Bounded HTTP drain, socket tracking, forced close
 adapter.ts         → AgentAdapter interface (extensibility point)
 adapters/

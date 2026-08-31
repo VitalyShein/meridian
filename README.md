@@ -118,9 +118,15 @@ Prime Agent is reliable through Meridian with one active agent. RLM children hav
 separate session identities and can execute successfully, but concurrent subagent
 orchestration is not yet production-safe. Observed failure modes include overload
 amplification, expensive cache churn after fresh-session replay, loss of child-task
-context during recovery, undelivered tool envelopes, and incomplete parent-to-child
-cancellation. Use a single active Prime Agent for unattended or usage-sensitive work
-until coordinated fixes land in Prime Agent and Meridian.
+context during recovery, and undelivered tool envelopes. Use a single active Prime
+Agent for unattended or usage-sensitive work until coordinated fixes land in Prime
+Agent and Meridian.
+
+Parent-to-child cancellation is handled on the Meridian side: when the extension
+stamps `parent_session_id` alongside the child's session id, aborting a parent's
+in-flight request aborts every live request in the subtree below it and evicts
+each one's session mapping. See
+[Subagent cancellation](docs/agents.md#prime-agent).
 
 Prime Agent can keep Opus on the root session while selecting Sol for an individual
 child. A child inherits its parent's model unless the `rlm` call supplies an exact
