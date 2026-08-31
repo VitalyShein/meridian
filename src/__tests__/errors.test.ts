@@ -620,6 +620,65 @@ describe("classifyError: session/usage limit phrasings (live-observed)", () => {
     expect(r.status).toBe(429)
   })
 
+  it("maps the CLI's 'You've hit your org's monthly spend limit' to rate_limit_error", () => {
+    const r = classifyError("Claude Code returned an error result: You've hit your org's monthly spend limit · ask your admin to raise it at claude.ai/settings/usage")
+    expect(r.type).toBe("rate_limit_error")
+    expect(r.status).toBe(429)
+  })
+
+  it("maps the CLI's 'You've hit your monthly spend limit' to rate_limit_error", () => {
+    const r = classifyError("You've hit your monthly spend limit · raise it at claude.ai/settings/usage · your session limit resets 5pm (Europe/Warsaw)")
+    expect(r.type).toBe("rate_limit_error")
+    expect(r.status).toBe(429)
+  })
+
+  // The spend-limit pattern allows four qualifier words, which is a much wider
+  // net than the single-word HIT_YOUR_LIMIT. Unanchored it matched all three of
+  // these. Each would mark a healthy account exhausted and drop it out of a
+  // priority pool — the same outage this fix prevents, from the other side.
+  it("does not treat a negated spend-limit sentence as a rate limit", () => {
+    const r = classifyError("You have not hit your monthly spend limit yet, so this is unrelated.")
+    expect(r.type).not.toBe("rate_limit_error")
+    expect(isAccountFailoverError(r.type)).toBe(false)
+  })
+
+  it("does not treat a quoted spend-limit phrase as a rate limit", () => {
+    const r = classifyError("The docs say: when you've hit your monthly spend limit, ask your admin to raise it.")
+    expect(r.type).not.toBe("rate_limit_error")
+    expect(isAccountFailoverError(r.type)).toBe(false)
+  })
+
+  it("does not treat a spend-limit phrase quoted inside tool stderr as a rate limit", () => {
+    const r = classifyError("Subprocess stderr: helper printed \"You've hit your org's monthly spend limit\" and exited")
+    expect(r.type).not.toBe("rate_limit_error")
+    expect(isAccountFailoverError(r.type)).toBe(false)
+  })
+
+  // The CLI surfaces a limit banner by exiting and appending it to stderr. A
+  // whole-message anchor missed that shape, and the fall-through was a 401
+  // telling the operator to run `claude login` for a quota refusal — while the
+  // session-limit banner in the identical shape classified correctly.
+  it("maps a spend-limit banner appended to subprocess stderr to rate_limit_error", () => {
+    const r = classifyError("Claude Code process exited with code 1\nSubprocess stderr: You've hit your org's monthly spend limit \u00b7 ask your admin to raise it")
+    expect(r.type).toBe("rate_limit_error")
+    expect(r.status).toBe(429)
+    expect(r.message).not.toContain("claude login")
+  })
+
+  it("classifies the stderr-appended spend and session banners the same way", () => {
+    const spend = classifyError("Claude Code process exited with code 1\nSubprocess stderr: You've hit your monthly spend limit")
+    const session = classifyError("Claude Code process exited with code 1\nSubprocess stderr: You've hit your session limit")
+    expect(spend.type).toBe(session.type)
+    expect(spend.status).toBe(session.status)
+  })
+
+  // Typographic apostrophes: the CLI renders these in some terminals.
+  it("maps the curly-apostrophe spend-limit wording to rate_limit_error", () => {
+    const r = classifyError("You\u2019ve hit your org\u2019s monthly spend limit \u00b7 ask your admin to raise it")
+    expect(r.type).toBe("rate_limit_error")
+    expect(r.status).toBe(429)
+  })
+
   it("maps the CLI's 'You're out of usage credits' to rate_limit_error without a same-profile retry", () => {
     const msg = "Claude Code returned an error result: You're out of usage credits. /model to switch models."
     const r = classifyError(msg)
