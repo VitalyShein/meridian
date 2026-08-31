@@ -5,7 +5,6 @@
 
 ### Features
 
-* cancel RLM subagent trees when the parent request aborts ([99bedee](https://github.com/rynfar/meridian/commit/99bedeec7b9d212e36e2dd560d860ca48690419f))
 * cancel RLM subagent trees when the parent request aborts ([ad55c22](https://github.com/rynfar/meridian/commit/ad55c22b5e79ac963dec6a695eb05e9d56178c83)), closes [#902](https://github.com/rynfar/meridian/issues/902)
 * emit Retry-After and scope [1m] rate-limit benching per session ([49e04d1](https://github.com/rynfar/meridian/commit/49e04d131a6b168986cef53b99780ef624a092ff))
 
