@@ -93,8 +93,16 @@ import {
   ProfileExhaustion,
   AssignmentStore,
   resolveCooldownUntil,
+  findCooldownReset,
+  type CooldownWindow,
   type PriorityAssignment,
 } from "./routing"
+import {
+  retryAfterSeconds,
+  retryAfterHeaders,
+  retryAfterBodyFields,
+  OVERLOADED_RETRY_AFTER_SECONDS,
+} from "./retryAfter"
 import { getSetting, setSetting } from "./settings"
 import { filterBetasForProfile, getBetaPolicyFromEnv } from "./betas"
 import { createFileChangeHook, extractFileChangesFromMessages, formatFileChangeSummary, type FileChange } from "./fileChanges"
@@ -774,6 +782,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       ? { type: "error", error: { type, message } }
       : { error: { type, message, code: null } }
   const DRAIN_MESSAGE = "Meridian is shutting down and is not accepting new requests. Retry against another instance."
+  /** Every transient 503/529 Meridian raises itself — drain, unavailable
+   *  durable state, a contended cross-process turn — clears in seconds rather
+   *  than at a quota boundary, so they share one short hint (#901). */
+  const TRANSIENT_RETRY_AFTER_HEADERS = retryAfterHeaders(OVERLOADED_RETRY_AFTER_SECONDS)
   // Each route answers in its own envelope. /v1/responses reports every other
   // error (both 400s below it) in the OpenAI shape, so handing it the
   // Anthropic one here would make the drain 503 the single reply on that route
@@ -781,7 +793,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   const drainingResponse = (shape: ErrorShape = "anthropic"): Response =>
     new Response(JSON.stringify(errorEnvelope(shape, "overloaded_error", DRAIN_MESSAGE)), {
       status: 503,
-      headers: { "Content-Type": "application/json", "x-meridian-draining": "1" },
+      headers: {
+        "Content-Type": "application/json",
+        "x-meridian-draining": "1",
+        // A drain is a restart, not a spent quota. Tell the client how long to
+        // hold rather than leaving it to guess (#901).
+        ...TRANSIENT_RETRY_AFTER_HEADERS,
+      },
     })
 
   /**
@@ -810,6 +828,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     const headers: Record<string, string> = { "Content-Type": "application/json" }
     const drainingHeader = internalRes.headers.get("x-meridian-draining")
     if (drainingHeader) headers["x-meridian-draining"] = drainingHeader
+    // A compat client is throttled by the same window as an Anthropic-shaped
+    // one; dropping the hint here would leave /v1/responses and
+    // /v1/chat/completions callers with nothing to back off against (#901).
+    const innerRetryAfter = internalRes.headers.get("retry-after")
+    if (innerRetryAfter) headers["Retry-After"] = innerRetryAfter
     return new Response(JSON.stringify(payload), { status: internalRes.status, headers })
   }
 
@@ -939,26 +962,38 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     return Array.isArray(setting) && setting.length > 0 ? setting : undefined
   }
 
-  /** Tier 1 + 3: this profile's own observed five_hour reset, else a
-   *  conservative default so a mis-mark self-heals. Never blocks.
+  /** This profile's usage windows, normalized for the cooldown resolvers.
    *
-   *  Gated the same way as tier 2's `refinePriorityCooldown`: a healthy
-   *  account always has a `five_hour` window with a future `resetsAt` —
-   *  that boundary exists regardless of consumption, so a scoped entry's
-   *  mere presence doesn't prove the five-hour window caused THIS failure
-   *  (it could be a seven_day cap, or a transient upstream error). Only
-   *  trust the entry's `resetsAt` when it says the window was actually
-   *  exhausted (`status === "rejected"`, or `utilization >= 1` for older
-   *  entries that predate the `status` field); otherwise fall through to
-   *  the conservative default so tier 2 isn't left refining a wrong mark
-   *  it has no way to challenge. */
-  function priorityCooldownUntil(profileId: string, now: number): number {
-    const windows = rateLimitStore.getAll(profileId).map(e => ({
+   *  `exhausted` is deliberately strict: a healthy account always has a
+   *  `five_hour` window with a future `resetsAt` — that boundary exists
+   *  regardless of consumption, so a scoped entry's mere presence doesn't
+   *  prove the five-hour window caused THIS failure (it could be a seven_day
+   *  cap, or a transient upstream error). Only an entry that says the window
+   *  was actually spent (`status === "rejected"`, or `utilization >= 1` for
+   *  older entries that predate the `status` field) may be trusted. */
+  function profileCooldownWindows(profileId: string): CooldownWindow[] {
+    return rateLimitStore.getAll(profileId).map(e => ({
       type: e.rateLimitType ?? "",
       resetsAt: e.resetsAt,
       exhausted: e.status === "rejected" || (e.utilization ?? 0) >= 1,
     }))
-    return resolveCooldownUntil(windows, now, PRIORITY_DEFAULT_COOLDOWN_MS)
+  }
+
+  /** Tier 1 + 3: this profile's own observed five_hour reset, else a
+   *  conservative default so a mis-mark self-heals. Never blocks. Falling
+   *  through to the default is what keeps tier 2 from being left refining a
+   *  wrong mark it has no way to challenge. */
+  function priorityCooldownUntil(profileId: string, now: number): number {
+    return resolveCooldownUntil(profileCooldownWindows(profileId), now, PRIORITY_DEFAULT_COOLDOWN_MS)
+  }
+
+  /** When this account's own usage windows say it frees up, or null when
+   *  nothing proves a window is spent. Feeds `Retry-After` (#901) — telling a
+   *  client to wait until a boundary that was never the problem is worse than
+   *  the conservative constant. */
+  function observedResetAtMs(profileId: string | undefined, now: number): number | null {
+    if (!profileId) return null
+    return findCooldownReset(profileCooldownWindows(profileId), now)
   }
 
   /** Tier 2: the authoritative per-account reset from Anthropic's usage
@@ -1129,7 +1164,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           return options.context.json({
             type: "error",
             error: { type: "overloaded_error", message: "Durable priority attempt state is unavailable" },
-          }, 503)
+          }, 503, TRANSIENT_RETRY_AFTER_HEADERS)
         }
         attemptOwnerToken = claim.ownerToken
       } catch (error) {
@@ -1140,7 +1175,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         return options.context.json({
           type: "error",
           error: { type: "overloaded_error", message: "Durable priority attempt state is unavailable" },
-        }, 503)
+        }, 503, TRANSIENT_RETRY_AFTER_HEADERS)
       }
     }
     const settleAttempt = (disposition: "release" | "block"): boolean => {
@@ -1161,12 +1196,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     const unavailableAttemptResponse = (): Response => options.context.json({
       type: "error",
       error: { type: "overloaded_error", message: "Durable priority attempt state is unavailable" },
-    }, 503)
+    }, 503, TRANSIENT_RETRY_AFTER_HEADERS)
 
     let lastError: unknown = null
     let lastStatus = 429
     let previous: string | null = null
     let previousReason = "rate_limit_error"
+    // When every candidate is spent, the honest wait is until the FIRST one
+    // frees up, not the last one tried. Tracked across the loop so the caller's
+    // Retry-After names the pool's earliest opening (#901).
+    let earliestPoolReset: number | null = null
     for (const [attempt, candidate] of options.candidateIds.entries()) {
       const exposure: PriorityAttemptExposure = { committed: false }
       const priorityPublication = options.durableRoute && options.publicationTurn
@@ -1216,6 +1255,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         ? priorityCooldownUntil(candidate, Date.now())
         : Date.now() + PRIORITY_DEFAULT_COOLDOWN_MS
       priorityExhaustion.mark(candidate, cooldownUntil, reason)
+      if (earliestPoolReset === null || cooldownUntil < earliestPoolReset) {
+        earliestPoolReset = cooldownUntil
+      }
       claudeLog("priority.exhausted", { profile: candidate, until: cooldownUntil, reason })
       if (quotaRefusal) refinePriorityCooldown(candidate)
       lastError = sniffed.errorPayload
@@ -1237,13 +1279,26 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     if (!settleAttempt("release")) return unavailableAttemptResponse()
     // Surface the LAST tried profile's error (owner decision). Stream sniff
     // consumed the inner body, so reconstruct the exact frame for SSE requests.
+    // The SSE frame carries its own `retry_after` field, relayed verbatim from
+    // whichever attempt produced it — headers are unavailable to a stream.
     if (options.wantsStream) {
       return new Response(`event: error\ndata: ${JSON.stringify(lastError)}\n\n`, {
         status: 200,
         headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" },
       })
     }
-    return new Response(JSON.stringify(lastError), { status: lastStatus, headers: { "content-type": "application/json" } })
+    // The wait belongs to the POOL, not to the last account tried: the caller
+    // can proceed as soon as ANY candidate frees up. `earliestPoolReset` is a
+    // real observed boundary when a quota refusal supplied one and the
+    // conservative default otherwise, so it is always safe to say (#901).
+    const poolRetryAfter = retryAfterSeconds({
+      status: lastStatus,
+      resetAtMs: earliestPoolReset,
+    })
+    return new Response(JSON.stringify(lastError), {
+      status: lastStatus,
+      headers: { "content-type": "application/json", ...retryAfterHeaders(poolRetryAfter) },
+    })
   }
 
   app.use("/auth/*", requireAuth)
@@ -1460,6 +1515,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         priorityTerminalCommitted = true
       }
 
+      // The outer catch runs outside the profile's scope but still has to
+      // answer 429/503, and a Retry-After derived from this account's own
+      // observed reset beats a constant (#901). Stays undefined when the
+      // failure fired before the profile resolved.
+      let resolvedProfileId: string | undefined
+
       try {
         const body = options.body
         const markPriorityAttemptExposure = (reason: string): void => {
@@ -1571,7 +1632,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   return c.json({
                     type: "error",
                     error: { type: "overloaded_error", message: "Durable priority routing state is unavailable" },
-                  }, 503)
+                  }, 503, TRANSIENT_RETRY_AFTER_HEADERS)
                 }
                 if (routeResult.status === "found") {
                   durableRoute = { routeKey, expectedGeneration: routeResult.generation }
@@ -1613,7 +1674,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     return c.json({
                       type: "error",
                       error: { type: "overloaded_error", message: "Durable priority session state is unavailable" },
-                    }, 503)
+                    }, 503, TRANSIENT_RETRY_AFTER_HEADERS)
                   }
                   routeMappingIsCurrent = mapped.status === "found"
                     && mapped.generation === routeResult.assignment.mappingGeneration
@@ -1625,7 +1686,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       return c.json({
                         type: "error",
                         error: { type: "overloaded_error", message: "Durable priority session state is unavailable" },
-                      }, 503)
+                      }, 503, TRANSIENT_RETRY_AFTER_HEADERS)
                     }
                     durableRoute = { ...durableRoute, forceFreshReplay: true }
                   }
@@ -1635,7 +1696,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   return c.json({
                     type: "error",
                     error: { type: "overloaded_error", message: "Durable priority attempt state is unavailable" },
-                  }, 503)
+                  }, 503, TRANSIENT_RETRY_AFTER_HEADERS)
                 } else if (trustedTurn) {
                   durableRoute = { routeKey, expectedGeneration: routeResult.generation }
                   publicationTurn = trustedTurn
@@ -1672,7 +1733,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 return c.json({
                   type: "error",
                   error: { type: "overloaded_error", message: "Durable priority routing state is unavailable" },
-                }, 503)
+                }, 503, TRANSIENT_RETRY_AFTER_HEADERS)
               }
               const pick = choosePriorityProfile(order, id => priorityExhaustion.isExhausted(id))
               const first = retainOnlyProfile
@@ -1712,6 +1773,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             ? { routingMode, stickySessionKey: adapter.getSessionId(c, body) }
             : undefined
         )
+        resolvedProfileId = profile.id
 
         const authStatus = await getClaudeAuthStatusAsync(
           profile.id !== "default" ? profile.id : undefined,
@@ -1735,7 +1797,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           declaredAgentMode === "subagent" || requestSource?.startsWith("subagent-") === true
         const agentMode = isSubagentRequest ? "subagent" : declaredAgentMode
         const requestedModel = typeof body.model === "string" ? body.model : "sonnet"
-        let model = mapModelToClaudeModel(requestedModel, authStatus?.subscriptionType, agentMode, profile.id)
+        // A rate-limit bench on [1m] is scoped to the session that earned it
+        // (#901), so model mapping needs the conversation identity. Resolved
+        // here rather than reusing `agentSessionId` below because that one is
+        // read after the transform pipeline: recording and reading a bench must
+        // agree, and this is the value both sides see. Undefined for clients
+        // with no session identity — those fall back to the profile-wide bench,
+        // exactly as before.
+        const benchSessionKey = adapter.getSessionId(c, body) || undefined
+        let model = mapModelToClaudeModel(requestedModel, authStatus?.subscriptionType, agentMode, profile.id, benchSessionKey)
         // Explicitly versioned ids override their tier's canonical pin for
         // this request (spread last in query.ts env, so they also beat
         // operator env) — a proxy must never substitute models. Bare aliases
@@ -3339,11 +3409,17 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     if (hasExtendedContext(model)) {
                       const from = model
                       model = stripExtendedContext(model)
-                      // Bench [1m] for this profile until its window resets. Without
-                      // this the next request maps straight back to [1m], so one rate
-                      // limit costs TWO model switches and a cold prompt cache in both
-                      // directions — routinely more than the rate limit itself (#862).
-                      recordExtendedContextRateLimited(profile.id, priorityCooldownUntil(profile.id, Date.now()))
+                      // Bench [1m] until the window resets. Without this the next
+                      // request maps straight back to [1m], so one rate limit costs
+                      // TWO model switches and a cold prompt cache in both directions
+                      // — routinely more than the rate limit itself (#862).
+                      //
+                      // Benched for THIS SESSION, not the whole profile (#901): a
+                      // harness running N children through one account had every
+                      // sibling downgraded the instant one child was limited, and the
+                      // switch cold-caches each of them. Extra Usage exhaustion is
+                      // still profile-wide — that one really is account-scoped.
+                      recordExtendedContextRateLimited(profile.id, priorityCooldownUntil(profile.id, Date.now()), benchSessionKey)
                       claudeLog("upstream.context_fallback", {
                         mode: "non_stream",
                         from,
@@ -4358,11 +4434,17 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                       if (hasExtendedContext(model)) {
                         const from = model
                         model = stripExtendedContext(model)
-                        // Bench [1m] for this profile until its window resets. Without
-                        // this the next request maps straight back to [1m], so one rate
-                        // limit costs TWO model switches and a cold prompt cache in both
-                        // directions — routinely more than the rate limit itself (#862).
-                        recordExtendedContextRateLimited(profile.id, priorityCooldownUntil(profile.id, Date.now()))
+                        // Bench [1m] until the window resets. Without this the next
+                        // request maps straight back to [1m], so one rate limit costs
+                        // TWO model switches and a cold prompt cache in both directions
+                        // — routinely more than the rate limit itself (#862).
+                        //
+                        // Benched for THIS SESSION, not the whole profile (#901): a
+                        // harness running N children through one account had every
+                        // sibling downgraded the instant one child was limited, and the
+                        // switch cold-caches each of them. Extra Usage exhaustion is
+                        // still profile-wide — that one really is account-scoped.
+                        recordExtendedContextRateLimited(profile.id, priorityCooldownUntil(profile.id, Date.now()), benchSessionKey)
                         claudeLog("upstream.context_fallback", {
                           mode: "stream",
                           from,
@@ -5687,6 +5769,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 : classifyError(errMsg, model)
               claudeLog("proxy.anthropic.error", { error: errMsg, classified: streamErr.type })
 
+              // How long the client should wait before retrying. A streaming
+              // turn's response headers went out with `message_start`, long
+              // before this failure existed, so the error frame is the only
+              // place a hint can still reach the client (#901).
+              const streamRetryAfter = retryAfterSeconds({
+                status: streamErr.status,
+                errorMessage: errMsg,
+                resetAtMs: observedResetAtMs(profile.id, Date.now()),
+              })
+
               // Surface the SDK termination reason (max_turns / process_exit / aborted)
               // and stderr tail to /telemetry/logs?category=error so failures are
               // visible without trawling raw log files.
@@ -6062,7 +6154,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 // client at all.
                 safeEnqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({
                   type: "error",
-                  error: { type: streamErr.type, message: streamErr.message }
+                  error: { type: streamErr.type, message: streamErr.message, ...retryAfterBodyFields(streamRetryAfter) }
                 })}\n\n`), "error_event_before_stop")
                 safeEnqueue(encoder.encode(
                   `event: message_stop\ndata: {"type":"message_stop"}\n\n`
@@ -6072,7 +6164,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 // close — the error event is the whole response.
                 safeEnqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({
                   type: "error",
-                  error: { type: streamErr.type, message: streamErr.message }
+                  error: { type: streamErr.type, message: streamErr.message, ...retryAfterBodyFields(streamRetryAfter) }
                 })}\n\n`), "error_event")
               }
               if (!streamClosed) {
@@ -6135,6 +6227,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           ? { status: 499, type: "request_cancelled", message: "The request was cancelled" }
           : classifyError(errMsg)
 
+        // Non-streaming failures still own their headers here, so the hint goes
+        // out as a real `Retry-After` (#901). `resolvedProfileId` is undefined
+        // when the request died before profile resolution, which just means the
+        // per-status default stands.
+        const retryAfter = retryAfterSeconds({
+          status: classified.status,
+          errorMessage: errMsg,
+          resetAtMs: observedResetAtMs(resolvedProfileId, Date.now()),
+        })
+
         claudeLog("proxy.error", { error: errMsg, classified: classified.type })
 
         // Surface the SDK termination reason. Outer-catch context is limited —
@@ -6179,8 +6281,20 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         })
 
         return new Response(
-          JSON.stringify({ type: "error", error: { type: classified.type, message: classified.message } }),
-          { status: classified.status, headers: { "Content-Type": "application/json" } }
+          JSON.stringify({
+            type: "error",
+            error: {
+              type: classified.type,
+              message: classified.message,
+              // Mirrored in the body so one field name means one thing on both
+              // the JSON and SSE paths; the header above is the contract.
+              ...retryAfterBodyFields(retryAfter),
+            },
+          }),
+          {
+            status: classified.status,
+            headers: { "Content-Type": "application/json", ...retryAfterHeaders(retryAfter) },
+          }
         )
       } finally {
         if (!streamOwnsAbortLink) {
@@ -6354,7 +6468,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                   type: "overloaded_error",
                   message: "Timed out waiting for another process to finish this session turn",
                 },
-              }), { status: 529, headers: { "Content-Type": "application/json" } })
+              }), { status: 529, headers: { "Content-Type": "application/json", ...TRANSIENT_RETRY_AFTER_HEADERS } })
             }
             throw error
           }

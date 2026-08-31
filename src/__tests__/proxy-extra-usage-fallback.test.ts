@@ -30,8 +30,9 @@ interface LifecycleResourceSnapshot {
 
 let queryCalls: Array<{ model: string; callIndex: number; resume?: string; sessionId?: string }> = []
 let queryCallCount = 0
-/** Benches recorded when a [1m] model is stripped after a rate limit (#862). */
-let rateLimitBenches: Array<{ profileId: string | undefined; until: number }> = []
+/** Benches recorded when a [1m] model is stripped after a rate limit (#862),
+ *  with the session scope they were recorded against (#901). */
+let rateLimitBenches: Array<{ profileId: string | undefined; until: number; sessionKey?: string }> = []
 let lifecycleStateAtSpawn: Array<{ sessionId: string; state: string | undefined }> = []
 
 // Control what the mock does
@@ -54,8 +55,8 @@ mock.module("../proxy/models", () => ({
   stripExtendedContext: (model: string) => model.replace("[1m]", ""),
   isClosedControllerError: () => false,
   recordExtendedContextUnavailable: () => {},
-  recordExtendedContextRateLimited: (profileId: string | undefined, until: number) => {
-    rateLimitBenches.push({ profileId, until })
+  recordExtendedContextRateLimited: (profileId: string | undefined, until: number, sessionKey?: string) => {
+    rateLimitBenches.push({ profileId, until, sessionKey })
   },
   isExtendedContextKnownUnavailable: () => false,
   getAuthCacheInfo: () => ({ lastCheckedAt: 0, lastSuccessAt: 0, isFailure: false }),
@@ -380,6 +381,39 @@ describe("Extra usage required fallback", () => {
 
       expect(rateLimitBenches.length).toBe(1)
       expect(rateLimitBenches[0]!.until).toBeGreaterThan(Date.now())
+    })
+
+    it("scopes the rate-limit bench to the requesting session (#901)", async () => {
+      // A profile-wide bench downgrades every concurrent sibling of an RLM
+      // harness the instant one child is limited, and the model switch cold-
+      // caches all of them. The bench has to name the session that earned it.
+      mockBehavior = "error_assistant_then_ratelimit"
+      const app = createTestApp()
+
+      const response = await post(app, {
+        model: "sonnet",
+        stream: false,
+        messages: [{ role: "user", content: "hello" }],
+      }, { "x-opencode-session": "rlm-child-7" })
+      expect(response.status).toBe(200)
+
+      expect(rateLimitBenches.length).toBe(1)
+      expect(rateLimitBenches[0]!.sessionKey).toBe("rlm-child-7")
+    })
+
+    it("falls back to a profile-wide bench when the client has no session id (#901)", async () => {
+      mockBehavior = "error_assistant_then_ratelimit"
+      const app = createTestApp()
+
+      const response = await post(app, {
+        model: "sonnet",
+        stream: false,
+        messages: [{ role: "user", content: "hello" }],
+      })
+      expect(response.status).toBe(200)
+
+      expect(rateLimitBenches.length).toBe(1)
+      expect(rateLimitBenches[0]!.sessionKey).toBeUndefined()
     })
   })
 })
