@@ -364,9 +364,16 @@ export default function (pi: ExtensionAPI) {
     if (ctx?.model?.provider !== MERIDIAN_PROVIDER) return undefined
     const sessionId = ctx?.sessionManager?.getSessionId?.()
     if (typeof sessionId !== "string" || !sessionId) return undefined
+    const identity: Record<string, string> = { session_id: sessionId }
+    // Optional, and only present on newer Prime Agent builds. It is what lets
+    // Meridian cancel a whole subagent tree — see "Subagent cancellation".
+    const parentSessionId = ctx?.sessionManager?.getParentSessionId?.()
+    if (typeof parentSessionId === "string" && parentSessionId) {
+      identity.parent_session_id = parentSessionId
+    }
     return {
       ...(event.payload as Record<string, unknown>),
-      metadata: { user_id: JSON.stringify({ session_id: sessionId }) },
+      metadata: { user_id: JSON.stringify(identity) },
     }
   })
 }
@@ -404,6 +411,23 @@ design, the model loses track of what it has already run. Stamping
 `metadata.user_id` makes each round a continuation instead, so the SDK keeps the
 real tool calls in its own session state. `getSessionId()` is distinct per
 agent, so RLM children get their own keys rather than colliding with the parent.
+
+**Subagent cancellation.** RLM children reach Meridian as independent requests
+on their own session keys, so cancelling the parent used to leave every child
+running — holding an SDK permit and billing the subscription until its own
+socket closed. `parent_session_id` closes that: it names the child's *immediate*
+parent, Meridian keeps a registry of in-flight requests and their parent links,
+and aborting a parent's request aborts every live request in the subtree below
+it, evicting each one's session mapping exactly as a direct cancel does.
+
+Three limits are deliberate. Only an actual abort propagates — a parent turn
+that merely finishes leaves its children alone, because a child routinely
+outlives the turn that spawned it. Only *live* requests are tracked; a session
+with nothing in flight is not remembered. And a client that omits
+`parent_session_id` is unaffected, which is the whole gate — there is no config
+flag. `POST /v1/sessions/<key>/cancel` cancels a subtree explicitly if you want
+to stop one without dropping sockets, and `/telemetry/summary` reports the
+counts under `sessionTree`.
 
 Detection is by the `x-meridian-agent: prime` header above, or
 `MERIDIAN_DEFAULT_AGENT=prime`. There is deliberately no User-Agent rule: in

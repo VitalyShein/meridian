@@ -33,6 +33,21 @@ export interface AgentIdentity {
   getSessionId(c: Context, body?: unknown): string | undefined
 
   /**
+   * Optional IMMEDIATE parent session key, for clients that declare a subagent
+   * tree (Prime Agent's RLM children stamp it in `metadata.user_id`).
+   *
+   * Two rules make this safe to consume:
+   *   - the value must be a key `getSessionId` could itself have produced, so
+   *     the returned string is directly comparable to another request's key;
+   *   - it must never alter this request's own key.
+   *
+   * Deeper trees name one level each, so consumers walk the chain. Returning
+   * undefined (the default) means the client declares no lineage, which is what
+   * keeps parent→child cancellation inert for every other client.
+   */
+  getParentSessionId?(c: Context, body?: unknown): string | undefined
+
+  /**
    * Optional client-declared agent mode. Adapters own their header/protocol
    * details; the proxy uses the normalized value for model-tier selection.
    */

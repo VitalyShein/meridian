@@ -9,6 +9,7 @@ import { query } from "@anthropic-ai/claude-agent-sdk"
 import { rateLimitStore } from "./rateLimitStore"
 import { guardUpstreamIdle, UpstreamIdleError } from "./streamIdleGuard"
 import { linkRequestAbort } from "./requestAbort"
+import { processSessionTree, truncateSessionKey, type SessionTreeRegistration } from "./sessionTree"
 import { AbortableSemaphore, getProcessSdkSemaphore, type SemaphoreLease } from "./concurrency"
 import { closeServerWithGracePeriod, trackServerConnections } from "./shutdown"
 import { fetchOAuthUsage, fetchOAuthUsageResult } from "./oauthUsage"
@@ -259,6 +260,15 @@ interface RequestMeta {
   }
   /** Permanently retain the session lease when mandatory durable cleanup fails. */
   retainSessionTurnFence?: () => void
+  /**
+   * Cancel this request's live session subtree (see `sessionTree.ts`).
+   *
+   * Present only for a keyed request. Called from the abort paths a CLIENT can
+   * reach — a request-signal abort and a cancelled response body — never from a
+   * turn that merely completed. Latches after the first call, so one client
+   * teardown that trips both paths propagates once.
+   */
+  cascadeSubtreeCancel?: (source: string) => void
 }
 
 interface PriorityAttemptExposure {
@@ -1311,7 +1321,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         status: "ok",
         service: "meridian",
         format: "anthropic",
-        endpoints: ["/v1/messages", "/messages", "/v1/chat/completions", "/v1/responses", "/v1/models", "/v1/design/*", "/design-login", "/telemetry", "/metrics", "/health"]
+        endpoints: ["/v1/messages", "/messages", "/v1/chat/completions", "/v1/responses", "/v1/models", "/v1/sessions/:key/cancel", "/v1/design/*", "/design-login", "/telemetry", "/metrics", "/health"]
       })
     }
     return c.html(landingHtml)
@@ -6183,6 +6193,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           cancel(reason) {
             requestAbort.abort(reason)
             requestAbort.detach()
+            // A cancelled response body is the other way a client says "stop",
+            // and the only one an in-process caller can reach. Children are
+            // cancelled here as well, latched so a real socket teardown —
+            // which trips both this and the request signal — propagates once.
+            requestMeta.cascadeSubtreeCancel?.("stream_cancel")
             if (!isIndependentSession && (
               !managedForkTarget || managedForkPublished || clientAssistantContentExposed
             )) {
@@ -6305,6 +6320,35 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     })
   }
 
+  /**
+   * Report one propagated subtree cancellation.
+   *
+   * Split out so the two client-reachable abort paths (request signal, cancelled
+   * response body) log identically and differ only in `source`.
+   */
+  const logSubtreeCancel = (
+    parentKey: string,
+    cancelled: { readonly keys: readonly string[]; readonly requestIds: readonly string[] },
+    requestId: string,
+    source: string,
+  ): void => {
+    const children = cancelled.keys.map((key) => truncateSessionKey(key))
+    claudeLog("session.tree_cancel_propagated", {
+      requestId,
+      source,
+      parent: truncateSessionKey(parentKey),
+      children,
+      requests: cancelled.requestIds.length,
+    })
+    // Named at session level: an autonomous run has nobody watching the
+    // dashboard, and this is the event that explains why a child turn died.
+    diagnosticLog.session(
+      `${requestId} session_tree_cancel source=${source} parent=${truncateSessionKey(parentKey)} `
+      + `children=${children.join(",")} requests=${cancelled.requestIds.length}`,
+      requestId,
+    )
+  }
+
   const handleWithQueue = async (c: Context, endpoint: string) => {
     // An internal hop carries a request the public route already admitted;
     // re-checking the gate here would refuse work that is legitimately in
@@ -6317,6 +6361,39 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     claudeLog("request.enter", { requestId, endpoint })
     let sessionTurnLease: SessionTurnLease | undefined
     let crossProcessTurnLease: CrossProcessTurnLease | undefined
+    let sessionTreeRegistration: SessionTreeRegistration | undefined
+    let detachSubtreeAbortWatch: (() => void) | undefined
+    let subtreeSessionKey: string | undefined
+    let subtreeCascaded = false
+    /**
+     * Cancel this request's live session subtree.
+     *
+     * Scope is deliberately narrow. Only a CLIENT abort propagates: a parent
+     * turn that merely completes leaves its children running, because a
+     * subagent routinely outlives the turn that spawned it. The shutdown path
+     * already aborts every in-flight request directly, and the lease watchdog
+     * is a proxy-side fence rather than a user intent, so neither cascades.
+     *
+     * Each child is aborted through its OWN request abort controller — the same
+     * one the lease watchdog and `forceAbortInFlight` use — so the mapping
+     * eviction, SDK permit release, and turn-lease release that follow are the
+     * existing abort path's, not a second implementation of it.
+     *
+     * Latched unconditionally: one client teardown can trip both the request
+     * signal and the response-body cancel, and every child that mattered was
+     * already in flight when the first of them fired.
+     */
+    const cascadeSubtreeCancel = (source: string): void => {
+      const parentKey = subtreeSessionKey
+      if (subtreeCascaded || !parentKey) return
+      subtreeCascaded = true
+      const cancelled = processSessionTree.cancelDescendants(
+        parentKey,
+        new Error(`Parent session ${truncateSessionKey(parentKey)} was cancelled`),
+      )
+      if (cancelled.requestIds.length === 0) return
+      logSubtreeCancel(parentKey, cancelled, requestId, source)
+    }
     const turnWatchdogAbort = new AbortController()
     activeRequestAborts.add(turnWatchdogAbort)
     let finished = false
@@ -6355,6 +6432,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
       } else {
         releaseSessionTurn(false)
       }
+      // The session tree is live requests only: a settled request is no longer
+      // a cancellation target, and a settled parent no longer cascades.
+      detachSubtreeAbortWatch?.()
+      detachSubtreeAbortWatch = undefined
+      sessionTreeRegistration?.release()
+      sessionTreeRegistration = undefined
       activeRequestAborts.delete(turnWatchdogAbort)
       inFlightRequests--
     }
@@ -6389,6 +6472,25 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         routingTurnIdentity = adapter.getRoutingTurnIdentity?.(c, body)
         const agentSessionId = adapter.getSessionId(c, body)
         if (agentSessionId) {
+          // Registered BEFORE the turn lease is acquired: a child queued behind
+          // its own session's running turn is exactly the request a parent abort
+          // most needs to reach, and the acquire wait already honors this
+          // controller's signal.
+          sessionTreeRegistration = processSessionTree.register({
+            requestId,
+            sessionKey: agentSessionId,
+            parentKey: adapter.getParentSessionId?.(c, body),
+            abort: (reason) => turnWatchdogAbort.abort(reason),
+          })
+          subtreeSessionKey = agentSessionId
+          const clientSignal = c.req.raw.signal
+          if (clientSignal.aborted) {
+            cascadeSubtreeCancel("client_abort")
+          } else {
+            const onClientAbort = () => cascadeSubtreeCancel("client_abort")
+            clientSignal.addEventListener("abort", onClientAbort, { once: true })
+            detachSubtreeAbortWatch = () => clientSignal.removeEventListener("abort", onClientAbort)
+          }
           const arrivalProfileIds = new Set(
             getEffectiveProfiles(finalConfig.profiles).map((profile) => profile.id),
           )
@@ -6486,6 +6588,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
         sharedSessionRevisionsAtArrival,
         routingTurnIdentity,
         retainSessionTurnFence: () => { retainSessionTurnFence = true },
+        cascadeSubtreeCancel,
       }
       const response = await handleMessages(c, requestMeta, {
         body,
@@ -6510,8 +6613,43 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   app.post("/v1/messages", (c) => handleWithQueue(c, "/v1/messages"))
   app.post("/messages", (c) => handleWithQueue(c, "/messages"))
 
+  /**
+   * Cancel a session's live requests and everything live below it.
+   *
+   * The same registry that powers abort propagation answers this for free, so a
+   * harness that wants to stop a subtree without tearing down sockets has a way
+   * to say so. It cancels only what is IN FLIGHT — there is no persistent tree,
+   * so an idle session reports `requests: 0` rather than being remembered.
+   *
+   * Gated by the `/v1/*` auth middleware like every other `/v1` route.
+   */
+  app.post("/v1/sessions/:key/cancel", (c) => {
+    const key = c.req.param("key")
+    if (!key) {
+      return c.json({ type: "error", error: { type: "invalid_request_error", message: "Session key is required" } }, 400)
+    }
+    const cancelled = processSessionTree.cancelSubtree(key, new Error("Session cancelled by request"))
+    if (cancelled.requestIds.length > 0) {
+      claudeLog("session.tree_cancel_requested", {
+        session: truncateSessionKey(key),
+        keys: cancelled.keys.map((cancelledKey) => truncateSessionKey(cancelledKey)),
+        requests: cancelled.requestIds.length,
+      })
+      diagnosticLog.session(
+        `session_tree_cancel_requested session=${truncateSessionKey(key)} requests=${cancelled.requestIds.length}`,
+      )
+    }
+    return c.json({
+      session: key,
+      cancelled: { sessions: cancelled.keys.length, requests: cancelled.requestIds.length },
+      requestIds: cancelled.requestIds,
+    })
+  })
+
   // Telemetry dashboard and API
-  app.route("/telemetry", createTelemetryRoutes())
+  app.route("/telemetry", createTelemetryRoutes({
+    getSessionTree: () => processSessionTree.stats(),
+  }))
 
   // SDK Features settings page and API
   app.get("/settings", (c) => {
