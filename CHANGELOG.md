@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.65.1](https://github.com/rynfar/meridian/compare/meridian-v1.65.0...meridian-v1.65.1) (2026-08-31)
+
+
+### Bug Fixes
+
+* **docker:** initialize machine identity in runtime image ([#903](https://github.com/rynfar/meridian/issues/903)) ([3f18494](https://github.com/rynfar/meridian/commit/3f18494db4267ff6cafe285529645b33c924b9a4))
+
 ## [1.65.0](https://github.com/rynfar/meridian/compare/meridian-v1.64.0...meridian-v1.65.0) (2026-08-29)
 
 
