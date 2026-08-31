@@ -7086,6 +7086,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             buffer = lines.pop() ?? ""
 
             for (const line of lines) {
+              if (line.startsWith(":")) {
+                controller.enqueue(encoder.encode(`${line}\n\n`))
+                continue
+              }
               if (!line.startsWith("data: ")) continue
               const dataStr = line.slice(6).trim()
               if (!dataStr) continue
@@ -7214,6 +7218,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             const lines = buffer.split("\n")
             buffer = lines.pop() ?? ""
             for (const line of lines) {
+              if (line.startsWith(":")) {
+                controller.enqueue(encoder.encode(`${line}\n\n`))
+                continue
+              }
               if (!line.startsWith("data: ")) continue
               const dataStr = line.slice(6).trim()
               if (!dataStr) continue
@@ -7258,7 +7266,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
   // comparison here used to advertise 200k to Team accounts that Meridian was
   // already routing to opus[1m] (#826).
   app.get("/v1/models", async (c) => {
-    const authStatus = await getClaudeAuthStatusAsync()
+    const profile = resolveProfile(finalConfig.profiles, finalConfig.defaultProfile)
+    const profileEnvOverrides = Object.keys(profile.env).length > 0 ? profile.env : undefined
+    const authStatus = await getClaudeAuthStatusAsync(
+      profile.id !== "default" ? profile.id : undefined,
+      profileEnvOverrides,
+    )
     const extendedContext = subscriptionIncludesExtendedContext(authStatus?.subscriptionType)
     return c.json({ object: "list", data: buildModelList(extendedContext) })
   })
