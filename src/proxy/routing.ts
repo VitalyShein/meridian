@@ -316,11 +316,28 @@ export function resolveCooldownUntil(
   now: number,
   defaultMs: number,
 ): number {
+  return findCooldownReset(windows, now) ?? now + defaultMs
+}
+
+/**
+ * The capped reset of the longest genuinely exhausted window, or null when
+ * nothing here proves a window is spent.
+ *
+ * Split out of `resolveCooldownUntil` so a caller can tell "the account told us
+ * when it frees up" from "we invented a conservative default" — a distinction
+ * `resolveCooldownUntil` erases by design. `Retry-After` needs it (#901): a
+ * real reset is worth sending, a fabricated one dressed as an observation is
+ * not.
+ */
+export function findCooldownReset(
+  windows: readonly CooldownWindow[],
+  now: number,
+): number | null {
   for (const type of COOLDOWN_WINDOWS) {
     const match = windows.find(w => w.type === type && w.exhausted && (w.resetsAt ?? 0) > now)
     if (match?.resetsAt) {
       return Math.min(match.resetsAt, now + cooldownCapMs(type))
     }
   }
-  return now + defaultMs
+  return null
 }

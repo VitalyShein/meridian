@@ -30,7 +30,7 @@ before investigating anything else.
 
 - **Do not add code to `server.ts` that belongs in a leaf module.** If it's pure logic (no HTTP, no Hono), extract it.
 - **`session/lineage.ts` must stay pure.** No side effects, no I/O, no imports from cache or server.
-- **Leaf modules (`errors.ts`, `models.ts`, `tools.ts`, `messages.ts`) must not import from `server.ts` or `session/`.** Dependencies flow downward only.
+- **Leaf modules (`errors.ts`, `retryAfter.ts`, `models.ts`, `tools.ts`, `messages.ts`) must not import from `server.ts` or `session/`.** Dependencies flow downward only.
 - **No circular dependencies.**
 
 ### Agent-Specific Logic
@@ -76,6 +76,7 @@ adapters/
   forgecode.ts     → ForgeCode-specific: XML CWD, patch/shell tools, passthrough
 query.ts           → buildQueryOptions (shared stream/non-stream SDK call builder)
 errors.ts          → classifyError (pure)
+retryAfter.ts      → Retry-After seconds for 429/503/529 (PURE)
 models.ts          → mapModelToClaudeModel, resolveClaudeExecutableAsync
 buildInfo.ts       → build provenance + semver compare (PURE)
 updateCheck.ts     → cached npm registry check for the newest release
