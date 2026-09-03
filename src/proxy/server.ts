@@ -2059,6 +2059,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             plog(`[PROXY] ${requestMeta.requestId} thinking disabled (thinking beta stripped by ${getBetaPolicyFromEnv()} policy)`)
           }
         }
+        // Thinking passthrough needs thinking *text*. In non-interactive (SDK)
+        // sessions Claude Code forces `display: "omitted"` unless a display is
+        // set explicitly, which yields thinking blocks with a signature but an
+        // empty body — nothing to forward as reasoning_content. Ask for the
+        // summarized display whenever the adapter forwards thinking.
+        if (sdkFeatures.thinkingPassthrough && thinking && thinking.type !== "disabled" && !thinking.display) {
+          thinking = { ...thinking, display: "summarized" }
+        }
         const parsedBudget = taskBudgetHeader ? Number.parseInt(taskBudgetHeader, 10) : NaN
         const taskBudget = Number.isFinite(parsedBudget)
           ? { total: parsedBudget }
